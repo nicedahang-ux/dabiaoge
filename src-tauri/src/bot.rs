@@ -385,7 +385,7 @@ fn has_user_tables(conn: &rusqlite::Connection) -> Result<bool, String> {
     Ok(false)
 }
 
-const MEMORY_EXPIRE_HOURS: i64 = 8;
+const MEMORY_EXPIRE_HOURS: i64 = 24;
 const ROUND_REMINDER_THRESHOLD: i32 = 3;
 
 fn is_fresh_memory(last_time: &str) -> bool {
@@ -424,7 +424,7 @@ async fn handle_message(
         let user_clone = user_id.to_string();
         tokio::spawn(async move {
             let ack = "已收到消息，正在查询处理中，请稍等~";
-            let _ = reply_via_webhook(&webhook_clone, &user_clone, ack).await;
+            let _ = reply_via_webhook(&webhook_clone, &user_clone, ack, "text", &[]).await;
             println!("[Bot Ack to {}]: {}", user_clone, ack);
         });
     }
@@ -432,7 +432,7 @@ async fn handle_message(
     // 如果数据库还没有任何用户表，直接回复引导语
     if !has_user_tables(&conn)? {
         let welcome = "你好！我是小妮 👋 目前系统里还没有数据表哦~\n\n你可以在电脑端上传 Excel 或 CSV 文件，我会帮你整理成漂亮的报表和看板。上传完后记得@我查数据！";
-        let _ = reply_via_webhook(webhook_url, user_id, welcome).await;
+        let _ = reply_via_webhook(webhook_url, user_id, welcome, "text", &[]).await;
         println!("[Bot Reply to {}]: {}", user_id, welcome);
         return Ok(());
     }
@@ -451,9 +451,8 @@ async fn handle_message(
     // 检查是否需要重置记忆
     if is_new_conversation_command(content) {
         messages = vec![json!({"role": "system", "content": BOT_SYSTEM_PROMPT})];
-        round_count = 0;
         let ack = "好的，咱们重新开始！之前的话题我已经忘光光啦，有什么新需求尽管说 😊";
-        let _ = reply_via_webhook(webhook_url, user_id, ack).await;
+        let _ = reply_via_webhook(webhook_url, user_id, ack, "text", &[]).await;
         println!("[Bot Reply to {}]: {}", user_id, ack);
         // 保存重置后的状态
         let memory_str = serde_json::to_string(&messages).unwrap_or_default();
@@ -468,9 +467,15 @@ async fn handle_message(
         messages = serde_json::from_str(&memory_json).unwrap_or_else(|_| {
             vec![json!({"role": "system", "content": BOT_SYSTEM_PROMPT})]
         });
+        println!("[Bot Memory] 用户 {} 记忆已加载，共 {} 条消息", user_id, messages.len());
     } else {
         messages = vec![json!({"role": "system", "content": BOT_SYSTEM_PROMPT})];
         round_count = 0;
+        if !memory_json.is_empty() {
+            println!("[Bot Memory] 用户 {} 记忆已过期，重置对话", user_id);
+        } else {
+            println!("[Bot Memory] 用户 {} 无历史记忆，新建对话", user_id);
+        }
     }
 
     messages.push(json!({"role": "user", "content": content}));
@@ -684,27 +689,68 @@ async fn handle_message(
         final_reply.push_str("\n\n💡 【小提示】咱们已经聊了挺多轮啦，如果需要换个话题查别的数据，可以直接跟我说「开始新对话」，我会清空之前的上下文重新开始哦~");
     }
 
-    // 4. 保存记忆（最近 5 轮）
+    // 4. 生成图表并上传（如果回复包含数据表格）
+    let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
+    let (processed_reply, image_urls) = match crate::chart_gen::process_tables_into_charts(&final_reply, &temp_dir).await {
+        Ok((reply, urls)) => {
+            println!("[Bot Chart] 生成 {} 张图表", urls.len());
+            (reply, urls)
+        }
+        Err(e) => {
+            eprintln!("[Bot Chart] 图表处理失败: {}", e);
+            (final_reply.clone(), vec![])
+        }
+    };
+
+    // 5. 保存记忆（最近 5 轮）
     messages.push(json!({"role": "assistant", "content": &final_reply}));
-    if messages.len() > 12 {
-        let skip = messages.len() - 12;
-        messages = messages.into_iter().skip(skip).collect();
+
+    // 过滤掉临时 system message（如 kb_hint），保留核心 system prompt 和对话历史
+    let memory_messages: Vec<serde_json::Value> = messages
+        .iter()
+        .filter(|m| {
+            if let (Some(role), Some(content)) = (m.get("role").and_then(|v| v.as_str()), m.get("content").and_then(|v| v.as_str())) {
+                // 过滤掉 kb_hint（包含特定标记的临时 system message）
+                if role == "system" && (content.contains("相关数据表信息") || content.contains("目前系统里有这些看板") || content.contains("看板详细信息")) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+
+    // 截断时保留开头的 system prompt，只截断旧的对话轮次
+    let system_prompt = memory_messages.first().cloned().filter(|m| {
+        m.get("role").and_then(|v| v.as_str()) == Some("system")
+    });
+    let non_system: Vec<serde_json::Value> = memory_messages.into_iter().skip(1).collect();
+    let mut truncated = if non_system.len() > 10 {
+        let skip = non_system.len() - 10;
+        non_system.into_iter().skip(skip).collect::<Vec<_>>()
+    } else {
+        non_system
+    };
+    if let Some(sp) = system_prompt {
+        truncated.insert(0, sp);
     }
-    let memory_json = serde_json::to_string(&messages).unwrap_or_default();
+
+    let memory_json = serde_json::to_string(&truncated).unwrap_or_default();
     let _ = conn.execute(
         "INSERT OR REPLACE INTO bot_chat_memory (user_id, messages, last_time, round_count) VALUES (?1, ?2, datetime('now'), ?3)",
         rusqlite::params![user_id, &memory_json, round_count],
     );
+    println!("[Bot Memory] 用户 {} 记忆已保存，共 {} 条消息（含 system prompt）", user_id, truncated.len());
 
-    // 5. 发送回复（Stream 模式优先使用 sessionWebhook）
-    if let Err(e) = reply_via_webhook(webhook_url, user_id, &final_reply).await {
+    // 6. 发送回复（Stream 模式优先使用 sessionWebhook）
+    if let Err(e) = reply_via_webhook(webhook_url, user_id, &processed_reply, "markdown", &image_urls).await {
         eprintln!("发送回复失败: {}", e);
         let _ = app.emit("bot-send-error", serde_json::json!({"error": e}));
     }
-    // 6. 同步到系统 AI 分析助手会话历史
+    // 7. 同步到系统 AI 分析助手会话历史
     let _ = sync_dingtalk_to_session(&conn, user_id, &messages);
 
-    println!("[Bot Reply to {}]: {}", user_id, final_reply);
+    println!("[Bot Reply to {}]: {}", user_id, processed_reply);
     Ok(())
 }
 
@@ -745,20 +791,49 @@ fn sync_dingtalk_to_session(
     Ok(())
 }
 
-async fn reply_via_webhook(webhook_url: &str, user_id: &str, content: &str) -> Result<(), String> {
+async fn reply_via_webhook(
+    webhook_url: &str,
+    user_id: &str,
+    content: &str,
+    msg_type: &str,
+    image_urls: &[String],
+) -> Result<(), String> {
     if webhook_url.is_empty() {
         return Err("sessionWebhook 为空，无法发送回复".to_string());
     }
     let client = reqwest::Client::new();
-    let body = json!({
-        "msgtype": "text",
-        "text": {
-            "content": content
-        },
-        "at": {
-            "atUserIds": [user_id]
-        }
-    });
+
+    let body = if msg_type == "markdown" {
+        let markdown_text = if image_urls.is_empty() {
+            content.to_string()
+        } else {
+            let mut text = content.to_string();
+            for url in image_urls {
+                text.push_str(&format!("\n\n![图表]({})", url));
+            }
+            text
+        };
+        json!({
+            "msgtype": "markdown",
+            "markdown": {
+                "title": "小妮数据助手",
+                "text": markdown_text
+            },
+            "at": {
+                "atUserIds": [user_id]
+            }
+        })
+    } else {
+        json!({
+            "msgtype": "text",
+            "text": {
+                "content": content
+            },
+            "at": {
+                "atUserIds": [user_id]
+            }
+        })
+    };
 
     let resp = client
         .post(webhook_url)

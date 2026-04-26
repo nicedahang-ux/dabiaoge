@@ -1,4 +1,5 @@
 mod bot;
+mod chart_gen;
 mod server;
 
 use calamine::Reader;
