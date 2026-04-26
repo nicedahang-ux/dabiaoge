@@ -396,6 +396,7 @@ export default function DatabaseView() {
               );
               const sysInfo = SYSTEM_TABLES[table];
               const isSystem = !!sysInfo;
+              const isLocked = table.startsWith("_board_");
               return (
                 <button
                   key={table}
@@ -417,6 +418,11 @@ export default function DatabaseView() {
                         <Shield className="h-3 w-3" />
                         {sysInfo.label}
                       </span>
+                    ) : isLocked ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] text-amber-600 font-medium">
+                        <Shield className="h-3 w-3" />
+                        锁定
+                      </span>
                     ) : (
                       tableRemarks[table] && (
                         <span className="text-[10px] text-slate-400 italic truncate max-w-[120px]">
@@ -424,7 +430,7 @@ export default function DatabaseView() {
                         </span>
                       )
                     )}
-                    {!isSystem && (
+                    {!isSystem && !isLocked && (
                       <>
                         <Button
                           variant="ghost"
@@ -461,7 +467,15 @@ export default function DatabaseView() {
                       </span>
                     </div>
                   )}
-                  {!isSystem && linked.length > 0 && (
+                  {isLocked && (
+                    <div className="flex items-center gap-1 pl-6">
+                      <Shield className="h-3 w-3 text-amber-500" />
+                      <span className="text-[10px] text-amber-500 truncate">
+                        看板数据锁定表，禁止编辑和上传，删除看板时自动删除
+                      </span>
+                    </div>
+                  )}
+                  {!isSystem && !isLocked && linked.length > 0 && (
                     <div className="flex items-center gap-1 pl-6">
                       <BarChart3 className="h-3 w-3 text-amber-500" />
                       <span className="text-[10px] text-slate-400 truncate">
@@ -500,7 +514,7 @@ export default function DatabaseView() {
               <Button variant="outline" size="sm" onClick={loadTableDetail}>
                 <RefreshCw className="mr-1 h-3 w-3" /> 刷新
               </Button>
-              {!SYSTEM_TABLES[selectedTable] && (
+              {!SYSTEM_TABLES[selectedTable] && !selectedTable.startsWith("_board_") && (
                 <Button variant="outline" size="sm" onClick={() => setUploadOpen(true)}>
                   <Upload className="mr-1 h-3 w-3" /> 上传表格
                 </Button>
@@ -510,7 +524,7 @@ export default function DatabaseView() {
                   <Code className="mr-1 h-3 w-3" /> Python代码
                 </Button>
               )}
-              {selectedRows.size > 0 && (
+              {selectedRows.size > 0 && !selectedTable.startsWith("_board_") && (
                 <>
                   <Button variant="outline" size="sm" onClick={() => setBatchOpen(true)}>
                     <SquarePen className="mr-1 h-3 w-3" />
@@ -705,10 +719,16 @@ export default function DatabaseView() {
                           {row.map((cell, ci) => (
                             <TableCell
                               key={ci}
-                              className="max-w-[200px] truncate text-xs"
-                              onDoubleClick={() =>
-                                handleCellDoubleClick(ri, ci, cell)
-                              }
+                              className={`max-w-[200px] truncate text-xs ${
+                                !selectedTable.startsWith("_board_")
+                                  ? "cursor-pointer hover:text-blue-600"
+                                  : ""
+                              }`}
+                              onDoubleClick={() => {
+                                if (!selectedTable.startsWith("_board_")) {
+                                  handleCellDoubleClick(ri, ci, cell);
+                                }
+                              }}
                             >
                               {editingCell?.row === ri &&
                               editingCell?.col === ci ? (

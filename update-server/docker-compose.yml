@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  update-server:
+    build: .
+    container_name: ai-excel-kanban-updater
+    ports:
+      - "10024:10024"
+    volumes:
+      # 将本地 public 目录挂载到容器内，方便随时更换安装包
+      - ./public:/app/public
+    environment:
+      - PORT=10024
+    restart: unless-stopped

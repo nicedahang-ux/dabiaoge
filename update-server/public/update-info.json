@@ -1,0 +1,6 @@
+{
+  "version": "0.2.0",
+  "notes": "优化表格处理功能，支持多表格与AI交互\n- 优化表格解析速度\n- 支持多表格同时上传与AI分析\n- 新增在线更新功能\n- 支持历史版本降级安装",
+  "pub_date": "2026-04-26T12:00:00Z",
+  "url": "https://excel.lidani.cn:8990/download/AI表格转看板_0.2.0_x64-setup.nsis.zip"
+}

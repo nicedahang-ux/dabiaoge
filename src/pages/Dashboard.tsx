@@ -18,6 +18,7 @@ import {
   Plus,
   Download,
   Upload,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -126,8 +127,12 @@ export default function DashboardPage() {
   const [htmlSrcDoc, setHtmlSrcDoc] = useState<string | null>(null);
   const [htmlLoading, setHtmlLoading] = useState(false);
   const [cacheVersion, setCacheVersion] = useState(0);
+  const [renderElapsed, setRenderElapsed] = useState(0);
+  const [showOptimizeTip, setShowOptimizeTip] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const dashboardDetailRef = useRef<HTMLDivElement>(null);
+  const renderTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const iframeContentTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     return subscribeHtmlCache(() => setCacheVersion((v) => v + 1));
@@ -149,21 +154,36 @@ export default function DashboardPage() {
   // HTML 看板数据注入：模块级缓存跨页面切换持久；源表数据更新会触发 invalidate 后自动重渲
   useEffect(() => {
     let cancelled = false;
+    // 清除之前的计时器
+    if (renderTimerRef.current) {
+      clearInterval(renderTimerRef.current);
+      renderTimerRef.current = null;
+    }
+    if (iframeContentTimerRef.current) {
+      clearInterval(iframeContentTimerRef.current);
+      iframeContentTimerRef.current = null;
+    }
+    setRenderElapsed(0);
+    setShowOptimizeTip(false);
+
     async function injectHtmlData() {
       if (!selectedDashboard?.html_content) {
         setHtmlSrcDoc(null);
+        setHtmlLoading(false);
         return;
       }
       const cacheKey = selectedDashboard.id;
       const cached = getCachedHtml(cacheKey);
       if (cached) {
         setHtmlSrcDoc(cached);
+        setHtmlLoading(false);
         return;
       }
       // 没有 source_table 的看板用静态 html_content 即可，无需拼接数据
       if (!selectedDashboard.source_table) {
         setHtmlSrcDoc(selectedDashboard.html_content);
         setCachedHtml(cacheKey, selectedDashboard.html_content, null);
+        setHtmlLoading(false);
         return;
       }
       setHtmlLoading(true);
@@ -174,6 +194,8 @@ export default function DashboardPage() {
         if (cancelled) return;
         setCachedHtml(cacheKey, html, selectedDashboard.source_table || null);
         setHtmlSrcDoc(html);
+        // 后端返回 HTML 后，iframe 开始加载，此时保持 htmlLoading=true
+        // 真正的渲染完成检测在 iframe onLoad 中进行
       } catch (e) {
         if (cancelled) return;
         console.error("HTML 渲染失败:", e);
@@ -184,13 +206,20 @@ export default function DashboardPage() {
         html = html.replace('</head>', hideCss + '</head>');
         setCachedHtml(cacheKey, html, selectedDashboard.source_table || null);
         setHtmlSrcDoc(html);
-      } finally {
-        if (!cancelled) setHtmlLoading(false);
+        setHtmlLoading(false);
       }
     }
     injectHtmlData();
     return () => {
       cancelled = true;
+      if (renderTimerRef.current) {
+        clearInterval(renderTimerRef.current);
+        renderTimerRef.current = null;
+      }
+      if (iframeContentTimerRef.current) {
+        clearInterval(iframeContentTimerRef.current);
+        iframeContentTimerRef.current = null;
+      }
     };
   }, [
     selectedDashboard?.id,
@@ -474,6 +503,24 @@ export default function DashboardPage() {
     }
   };
 
+  const handleOptimizeHtml = async () => {
+    if (!selectedDashboard) return;
+    try {
+      const id = await invoke<string>("create_session", {
+        title: `优化看板加载: ${selectedDashboard.name}`,
+        thoughtGuideMode: true,
+        dashboardId: selectedDashboard.id,
+      });
+      setCurrentSessionId(id);
+      setCurrentDashboardId(selectedDashboard.id);
+      setWorkbenchDashboardTag(selectedDashboard.id);
+      switchView("workbench");
+      toast.success("已创建优化会话，AI 将帮您优化看板加载速度");
+    } catch (e) {
+      toast.error("创建优化会话失败: " + String(e));
+    }
+  };
+
   const pieOption = {
     title: { text: "销售额分布", left: "center" },
     tooltip: { trigger: "item" },
@@ -607,7 +654,21 @@ export default function DashboardPage() {
     ws['!cols'] = colWidths;
     XLSX.utils.book_append_sheet(wb, ws, "数据");
     const fileName = `${selectedDashboard?.name || "export"}.xlsx`;
-    XLSX.writeFile(wb, fileName);
+    // 使用 Blob + URL.createObjectURL 方式，兼容 Tauri WebView 环境
+    try {
+      const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([wbout], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      toast.error("导出Excel失败: " + String(e));
+    }
   };
 
   return (
@@ -784,8 +845,22 @@ export default function DashboardPage() {
                     {htmlLoading && (
                       <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/85 backdrop-blur-[2px] rounded-md">
                         <Loader2 className="h-10 w-10 animate-spin text-blue-500" />
-                        <p className="text-base font-medium text-slate-700">看板正在加载中，请稍候…</p>
+                        <p className="text-base font-medium text-slate-700">看板正在渲染中</p>
                         <p className="text-xs text-slate-500">首次加载会执行 SQL 拼装数据，约需 2–10 秒</p>
+                        {renderElapsed > 0 && (
+                          <p className="text-xs text-slate-400">已渲染 {renderElapsed} 秒</p>
+                        )}
+                      </div>
+                    )}
+                    {showOptimizeTip && htmlLoading && (
+                      <div className="absolute top-2 right-2 z-20">
+                        <button
+                          onClick={handleOptimizeHtml}
+                          className="px-3 py-1.5 bg-amber-50 border border-amber-200 text-amber-700 text-xs rounded-md hover:bg-amber-100 flex items-center gap-1 shadow-sm"
+                        >
+                          <Zap className="h-3 w-3" />
+                          当前渲染时间超过5秒钟，可提交AI优化HTML加载速度
+                        </button>
                       </div>
                     )}
                     <iframe
@@ -804,6 +879,60 @@ export default function DashboardPage() {
                         // echarts 等异步内容渲染后再调整一次
                         setTimeout(adjustIframeHeight, 500);
                         setTimeout(adjustIframeHeight, 1500);
+
+                        // 真正的渲染完成检测：轮询 iframe body 内容
+                        const startTime = Date.now();
+                        let lastLength = 0;
+                        let stableCount = 0;
+
+                        if (iframeContentTimerRef.current) {
+                          clearInterval(iframeContentTimerRef.current);
+                        }
+
+                        iframeContentTimerRef.current = setInterval(() => {
+                          const iframe = iframeRef.current;
+                          const body = iframe?.contentDocument?.body;
+                          const bodyHtml = body?.innerHTML || "";
+                          const elapsed = Math.floor(
+                            (Date.now() - startTime) / 1000
+                          );
+
+                          setRenderElapsed(elapsed);
+
+                          // 内容足够丰富且稳定，认为渲染完成
+                          if (bodyHtml.length > 800) {
+                            if (Math.abs(bodyHtml.length - lastLength) < 50) {
+                              stableCount++;
+                              if (stableCount >= 2) {
+                                setHtmlLoading(false);
+                                setRenderElapsed(0);
+                                setShowOptimizeTip(false);
+                                if (iframeContentTimerRef.current) {
+                                  clearInterval(iframeContentTimerRef.current);
+                                  iframeContentTimerRef.current = null;
+                                }
+                                return;
+                              }
+                            } else {
+                              stableCount = 0;
+                            }
+                          }
+                          lastLength = bodyHtml.length;
+
+                          // 超过5秒提示优化
+                          if (elapsed >= 5) {
+                            setShowOptimizeTip(true);
+                          }
+
+                          // 最多检测60秒，避免无限轮询
+                          if (elapsed >= 60) {
+                            setHtmlLoading(false);
+                            if (iframeContentTimerRef.current) {
+                              clearInterval(iframeContentTimerRef.current);
+                              iframeContentTimerRef.current = null;
+                            }
+                          }
+                        }, 1000);
                       }}
                     />
                   </div>

@@ -83,8 +83,9 @@ fn generate_token() -> String {
 // ========== 数据库实时查询辅助函数（独立实现，避免与lib.rs循环依赖） ==========
 
 fn db_path() -> Result<std::path::PathBuf, String> {
-    let mut path = dirs::data_dir().ok_or("无法获取数据目录")?;
-    path.push("ai_dashboard");
+    let exe = std::env::current_exe().map_err(|e| format!("无法获取程序路径: {}", e))?;
+    let dir = exe.parent().ok_or("无法获取程序目录")?;
+    let mut path = dir.join("AIEXCEL");
     std::fs::create_dir_all(&path).map_err(|e| format!("创建目录失败: {}", e))?;
     path.push("data.db");
     Ok(path)

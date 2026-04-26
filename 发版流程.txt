@@ -1,0 +1,28 @@
+2. 在线更新机制
+组件	说明
+前端	使用 @tauri-apps/plugin-updater，支持自动检查、下载、安装、重启
+更新源	指向 https://excel.lidani.cn:8990/update.json
+更新包	构建时自动生成 .nsis.zip 更新包 + 签名验证（已配置为跳过验证）
+3. 更新服务（Docker）
+文件位于 [update-server/](update-server/) 目录：
+
+
+cd update-server
+docker-compose up -d
+监听端口：10024
+提供 /update.json 版本查询
+提供 /download/:filename 安装包下载
+提供 /admin/update-info 管理接口（修改版本信息）
+public/ 目录已挂载为 volume，可随时替换安装包
+4. 最终安装包
+src-tauri/target/release/bundle/nsis/AI表格转看板_0.1.0_x64-setup.exe
+
+5. 后续发版流程
+当你要发布新版本时：
+
+修改 src-tauri/tauri.conf.json 中的 version（如 0.1.1）
+修改 src/pages/SoftwareInfo.tsx 中的 CURRENT_VERSION
+重新构建：npx tauri build --bundles nsis（需要设置 TAURI_SIGNING_PRIVATE_KEY 环境变量）
+把生成的 .nsis.zip 放到 update-server/public/
+修改 update-server/public/update-info.json 中的 version 和 url
+用户点击"检查更新"即可自动升级

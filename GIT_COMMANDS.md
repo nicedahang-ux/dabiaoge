@@ -7,7 +7,7 @@ git status
 git add .
 
 ## 4. 打修改说明（提交到本地）
-git commit -m "优化分享功能"
+git commit -m "优化AI表格查看功能"
 
 # 带详细说明的提交
 git commit -m "功能标题" -m "详细描述修改内容"

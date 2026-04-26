@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
 
-export type ViewType = "settings" | "workbench" | "boards" | "database";
+export type ViewType = "settings" | "workbench" | "boards" | "database" | "software";
 
 export interface Attachment {
   filename: string;

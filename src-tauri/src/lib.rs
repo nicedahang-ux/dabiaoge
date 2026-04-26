@@ -4,6 +4,7 @@ mod server;
 
 use calamine::Reader;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use tauri::Emitter;
 use uuid::Uuid;
 
@@ -143,6 +144,63 @@ pub struct ParseExcelResult {
     pub sheets: Vec<SheetPreview>,
 }
 
+/// 对字符串进行 XML 文本转义（用于替换 CDATA 内容）
+fn xml_escape(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&apos;"),
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+/// 读取 xlsx 文件，移除 sheet XML 中的 CDATA 标记并转义内容后重新打包。
+/// 某些 BI 工具导出的 xlsx 使用 inlineStr + CDATA，calamine 无法读取 CDATA 内容，
+/// 通过预处理把 <t><![CDATA[内容]]></t> 替换为 <t>转义后的内容</t> 可以解决。
+fn remove_cdata_from_xlsx(path: &std::path::Path) -> Result<std::io::Cursor<Vec<u8>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取 zip 失败: {}", e))?;
+
+    let mut output = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut output);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+
+    // 匹配 <t><![CDATA[...]]></t> 或 <t xml:space="preserve"><![CDATA[...]]></t>
+    let cdata_re = regex::Regex::new(r"<t[^>]*><!\[CDATA\[(.*?)\]\]></t>").unwrap();
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| format!("读取 zip 条目失败: {}", e))?;
+        let name = entry.name().to_string();
+        let mut buf = Vec::new();
+        std::io::copy(&mut entry, &mut buf).map_err(|e| format!("复制 zip 内容失败: {}", e))?;
+
+        if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
+            let content = String::from_utf8_lossy(&buf);
+            let cleaned = cdata_re.replace_all(&content, |caps: &regex::Captures| {
+                let text = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let escaped = xml_escape(text);
+                format!("<t>{}</t>", escaped)
+            });
+            writer.start_file(&name, options).map_err(|e| format!("写入 zip 条目失败: {}", e))?;
+            writer.write_all(cleaned.as_bytes()).map_err(|e| format!("写入 zip 内容失败: {}", e))?;
+        } else {
+            writer.start_file(&name, options).map_err(|e| format!("写入 zip 条目失败: {}", e))?;
+            writer.write_all(&buf).map_err(|e| format!("写入 zip 内容失败: {}", e))?;
+        }
+    }
+
+    writer.finish().map_err(|e| format!("完成 zip 写入失败: {}", e))?;
+    output.set_position(0);
+    Ok(output)
+}
+
 #[tauri::command]
 async fn parse_excel(path: String) -> Result<ParseExcelResult, String> {
     let path = std::path::Path::new(&path);
@@ -183,7 +241,87 @@ async fn parse_excel(path: String) -> Result<ParseExcelResult, String> {
             is_truncated: true,
             truncated_rows: 50,
         });
-    } else if ext == "xlsx" || ext == "xls" {
+    } else if ext == "xlsx" {
+        // 某些 BI 工具导出的 xlsx 使用 inlineStr + CDATA，calamine 无法读取 CDATA 内容。
+        // 先预处理移除 CDATA 后读取；如果失败则回退到直接读取。
+        let try_parse = |bytes: std::io::Cursor<Vec<u8>>| -> Result<Vec<SheetPreview>, String> {
+            let mut workbook = calamine::open_workbook_auto_from_rs(bytes)
+                .map_err(|e| format!("Excel 解析失败: {}", e))?;
+            let sheet_names = workbook.sheet_names().to_vec();
+            let limit = if sheet_names.len() <= 2 { 50 } else { 10 };
+            let mut result: Vec<SheetPreview> = vec![];
+
+            for sheet_name in sheet_names {
+                let range = workbook
+                    .worksheet_range(&sheet_name)
+                    .map_err(|e| format!("读取工作表失败: {}", e))?;
+
+                let mut rows = range.rows();
+
+                // 跳过开头完全为空的行，找到第一个有内容的行
+                let mut candidate_columns: Vec<String> = vec![];
+                while let Some(row) = rows.next() {
+                    let parsed: Vec<String> = row.iter().map(|c| sanitize_col(&c.to_string())).collect();
+                    if parsed.iter().any(|s| !s.is_empty()) {
+                        candidate_columns = parsed;
+                        break;
+                    }
+                }
+
+                // 检测候选行是否像真正的表头：
+                // 如果超过 50% 的列是空的，或所有非空列都是纯数字，则认为这不是表头
+                let total_cols = candidate_columns.len().max(1);
+                let empty_count = candidate_columns.iter().filter(|s| s.is_empty()).count();
+                let non_empty: Vec<&String> = candidate_columns.iter().filter(|s| !s.is_empty()).collect();
+                let all_numeric = !non_empty.is_empty() && non_empty.iter().all(|s| s.parse::<f64>().is_ok());
+                let is_invalid_header = empty_count * 2 > total_cols || all_numeric;
+
+                let (columns, preview_data) = if is_invalid_header && !candidate_columns.is_empty() {
+                    // 生成默认列名，并把候选行放回数据预览
+                    let generated: Vec<String> = (1..=candidate_columns.len())
+                        .map(|i| format!("列{}", i))
+                        .collect();
+                    let first_row: Vec<String> = candidate_columns.iter().map(|s| s.clone()).collect();
+                    let mut data: Vec<Vec<String>> = vec![first_row];
+                    for row in rows.take(limit - 1) {
+                        data.push(row.iter().map(|c| c.to_string().trim().to_string()).collect());
+                    }
+                    (generated, data)
+                } else {
+                    let mut data: Vec<Vec<String>> = vec![];
+                    for row in rows.take(limit) {
+                        data.push(row.iter().map(|c| c.to_string().trim().to_string()).collect());
+                    }
+                    (candidate_columns, data)
+                };
+
+                result.push(SheetPreview {
+                    sheet_name: sheet_name.clone(),
+                    columns,
+                    preview_data,
+                    is_truncated: range.rows().count() > limit,
+                    truncated_rows: limit,
+                });
+            }
+            Ok(result)
+        };
+
+        // 先尝试预处理（移除 CDATA）后读取
+        let cleaned = remove_cdata_from_xlsx(path);
+        if let Ok(cursor) = cleaned {
+            if let Ok(parsed) = try_parse(cursor) {
+                if !parsed.is_empty() && !parsed.iter().all(|s| s.columns.iter().all(|c| c.is_empty())) {
+                    sheets = parsed;
+                } else if let Ok(raw) = std::fs::read(path) {
+                    sheets = try_parse(std::io::Cursor::new(raw))?;
+                }
+            } else if let Ok(raw) = std::fs::read(path) {
+                sheets = try_parse(std::io::Cursor::new(raw))?;
+            }
+        } else if let Ok(raw) = std::fs::read(path) {
+            sheets = try_parse(std::io::Cursor::new(raw))?;
+        }
+    } else if ext == "xls" {
         let mut workbook = calamine::open_workbook_auto(path)
             .map_err(|e| format!("Excel 解析失败: {}", e))?;
         let sheet_names = workbook.sheet_names().to_vec();
@@ -192,25 +330,46 @@ async fn parse_excel(path: String) -> Result<ParseExcelResult, String> {
         for sheet_name in sheet_names {
             let range = workbook
                 .worksheet_range(&sheet_name)
-                .ok_or_else(|| format!("工作表 {} 不存在", sheet_name))?
                 .map_err(|e| format!("读取工作表失败: {}", e))?;
 
             let mut rows = range.rows();
-            let columns: Vec<String> = rows
-                .next()
-                .map(|r| {
-                    r.iter()
-                        .map(|c| sanitize_col(&c.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
 
-            let mut preview_data: Vec<Vec<String>> = vec![];
-            for row in rows.take(limit) {
-                preview_data.push(
-                    row.iter().map(|c| c.to_string().trim().to_string()).collect(),
-                );
+            // 跳过开头完全为空的行，找到第一个有内容的行
+            let mut candidate_columns: Vec<String> = vec![];
+            while let Some(row) = rows.next() {
+                let parsed: Vec<String> = row.iter().map(|c| sanitize_col(&c.to_string())).collect();
+                if parsed.iter().any(|s| !s.is_empty()) {
+                    candidate_columns = parsed;
+                    break;
+                }
             }
+
+            // 检测候选行是否像真正的表头：
+            // 如果超过 50% 的列是空的，或所有非空列都是纯数字，则认为这不是表头
+            let total_cols = candidate_columns.len().max(1);
+            let empty_count = candidate_columns.iter().filter(|s| s.is_empty()).count();
+            let non_empty: Vec<&String> = candidate_columns.iter().filter(|s| !s.is_empty()).collect();
+            let all_numeric = !non_empty.is_empty() && non_empty.iter().all(|s| s.parse::<f64>().is_ok());
+            let is_invalid_header = empty_count * 2 > total_cols || all_numeric;
+
+            let (columns, preview_data) = if is_invalid_header && !candidate_columns.is_empty() {
+                // 生成默认列名，并把候选行放回数据预览
+                let generated: Vec<String> = (1..=candidate_columns.len())
+                    .map(|i| format!("列{}", i))
+                    .collect();
+                let first_row: Vec<String> = candidate_columns.iter().map(|s| s.clone()).collect();
+                let mut data: Vec<Vec<String>> = vec![first_row];
+                for row in rows.take(limit - 1) {
+                    data.push(row.iter().map(|c| c.to_string().trim().to_string()).collect());
+                }
+                (generated, data)
+            } else {
+                let mut data: Vec<Vec<String>> = vec![];
+                for row in rows.take(limit) {
+                    data.push(row.iter().map(|c| c.to_string().trim().to_string()).collect());
+                }
+                (candidate_columns, data)
+            };
 
             sheets.push(SheetPreview {
                 sheet_name: sheet_name.clone(),
@@ -225,6 +384,12 @@ async fn parse_excel(path: String) -> Result<ParseExcelResult, String> {
     }
 
     Ok(ParseExcelResult { sheets })
+}
+
+#[tauri::command]
+async fn read_file_base64(path: String) -> Result<String, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+    Ok(base64::encode(bytes))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -604,7 +769,7 @@ async fn chat_with_ai(
 async fn chat_workbench(
     app: tauri::AppHandle,
     messages: Vec<ChatMessagePayload>,
-    table_preview: Option<TablePreviewPayload>,
+    table_preview: Option<Vec<TablePreviewPayload>>,
     db_table_previews: Option<Vec<DbTablePreviewPayload>>,
     chat_attachment_previews: Option<Vec<ChatAttachmentPreviewPayload>>,
     thought_guide_mode: Option<bool>,
@@ -654,18 +819,24 @@ async fn chat_workbench(
         content: serde_json::Value::String(system_content),
     }];
 
-    if let Some(preview) = table_preview {
-        let preview_json = serde_json::to_string(&serde_json::json!({
-            "sheet_name": preview.sheet_name,
-            "columns": preview.columns,
-            "preview_data": preview.preview_data,
-        }))
-        .unwrap_or_default();
-        chat_messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: serde_json::Value::String(format!("当前表格预览数据:\n{}", preview_json)),
-        });
-        println!("[chat_workbench] 已注入表格预览数据到上下文");
+    if let Some(previews) = table_preview {
+        if !previews.is_empty() {
+            let mut table_text = format!("当前已加载 {} 张表格预览数据。当用户提到表格或数据时，请从下方对应表格中查找数据。\n", previews.len());
+            for (i, preview) in previews.iter().enumerate() {
+                let preview_json = serde_json::to_string(&serde_json::json!({
+                    "sheet_name": preview.sheet_name,
+                    "columns": preview.columns,
+                    "preview_data": preview.preview_data,
+                }))
+                .unwrap_or_default();
+                table_text.push_str(&format!("\n【表格 {}】\n{}\n", i + 1, preview_json));
+            }
+            chat_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: serde_json::Value::String(table_text),
+            });
+            println!("[chat_workbench] 已注入 {} 张表格预览数据到上下文", previews.len());
+        }
     }
 
     if let Some(db_previews) = db_table_previews {
@@ -2755,7 +2926,6 @@ async fn import_excel_to_table(
         let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
         let range = workbook
             .worksheet_range(&first_sheet)
-            .ok_or_else(|| format!("工作表 {} 不存在", first_sheet))?
             .map_err(|e| e.to_string())?;
         let mut rows = range.rows();
         let headers: Vec<String> = rows
@@ -2903,7 +3073,6 @@ async fn ingest_full_data(
         let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
         let range = workbook
             .worksheet_range(&first_sheet)
-            .ok_or_else(|| format!("工作表 {} 不存在", first_sheet))?
             .map_err(|e| e.to_string())?;
         columns = range
             .rows()
@@ -2960,7 +3129,6 @@ async fn ingest_full_data(
         let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
         let range = workbook
             .worksheet_range(&first_sheet)
-            .ok_or_else(|| format!("工作表 {} 不存在", first_sheet))?
             .map_err(|e| e.to_string())?;
         let mut rows = range.rows();
         rows.next(); // skip header
@@ -4437,7 +4605,9 @@ pub fn run() {
             check_refresh_signals,
             pack_dashboard,
             import_dashboard_pack,
+            read_file_base64,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

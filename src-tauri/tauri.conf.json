@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-app",
-  "version": "0.1.0",
-  "identifier": "com.administrator.tauri-app",
+  "productName": "AI表格转看板",
+  "version": "0.2.0",
+  "identifier": "com.aiexcel.kanban",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,25 +12,56 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-app",
+        "title": "AI表格转看板",
         "width": 800,
         "height": 600,
         "dragDropEnabled": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": [
+        {
+          "identifier": "default",
+          "windows": ["*"],
+          "permissions": [
+            "updater:allow-check",
+            "updater:allow-download",
+            "updater:allow-install",
+            "updater:allow-download-and-install",
+            "opener:allow-open-url",
+            "opener:allow-open-path"
+          ]
+        }
+      ]
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": "v1Compatible",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://excel.lidani.cn:8990/update.json"
+      ],
+      "dangerousWindowsUseSkipVerification": true,
+      "pubkey": "RWSluB0KZAX6om4zqhM1UIJcXXW8J61Lnd4ph57HETqlZn15VRsbBeCP"
+    }
   }
 }

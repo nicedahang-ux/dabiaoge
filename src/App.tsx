@@ -8,6 +8,7 @@ import {
   Copy,
   Check,
   Database,
+  Info,
 } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ import WorkbenchPage from "./pages/Workbench";
 import DashboardPage from "./pages/Dashboard";
 import SharePage from "./pages/SharePage";
 import DatabaseView from "./components/DatabaseView";
+import SoftwareInfo from "./pages/SoftwareInfo";
 
 function ShareButton() {
   const { boardsSelectedId } = useApp();
@@ -195,7 +197,7 @@ function MainLayout() {
         <div className="p-4 border-b border-slate-200">
           <div className="flex items-center gap-2 font-semibold text-slate-800">
             <Bot className="h-5 w-5 text-blue-600" />
-            AI 数据看板
+            AI表格转看板
           </div>
         </div>
         <nav className="flex-1 p-2 space-y-1">
@@ -204,6 +206,7 @@ function MainLayout() {
             { id: "workbench" as const, label: "AI分析助手", icon: Bot },
             { id: "boards" as const, label: "看板列表", icon: FileSpreadsheet },
             { id: "database" as const, label: "数据库", icon: Database },
+            { id: "software" as const, label: "软件信息", icon: Info },
           ].map((item) => {
             const Icon = item.icon;
             const isActive = activeView === item.id;
@@ -235,26 +238,21 @@ function MainLayout() {
         <div className="flex justify-end p-4 flex-shrink-0">
           {activeView === "boards" && <ShareButton />}
         </div>
-        {activeView === "settings" && (
-          <div className="flex-1 overflow-hidden flex flex-col">
-            <SettingsPage />
-          </div>
-        )}
-        {activeView === "workbench" && (
-          <div className="flex-1 overflow-hidden flex flex-col">
-            <WorkbenchPage />
-          </div>
-        )}
-        {activeView === "boards" && (
-          <div className="flex-1 overflow-hidden flex flex-col">
-            <DashboardPage />
-          </div>
-        )}
-        {activeView === "database" && (
-          <div className="flex-1 overflow-hidden flex flex-col">
-            <DatabaseView />
-          </div>
-        )}
+        <div className={`flex-1 overflow-hidden flex flex-col ${activeView !== "settings" ? "hidden" : ""}`}>
+          <SettingsPage />
+        </div>
+        <div className={`flex-1 overflow-hidden flex flex-col ${activeView !== "workbench" ? "hidden" : ""}`}>
+          <WorkbenchPage />
+        </div>
+        <div className={`flex-1 overflow-hidden flex flex-col ${activeView !== "boards" ? "hidden" : ""}`}>
+          <DashboardPage />
+        </div>
+        <div className={`flex-1 overflow-hidden flex flex-col ${activeView !== "database" ? "hidden" : ""}`}>
+          <DatabaseView />
+        </div>
+        <div className={`flex-1 overflow-hidden flex flex-col ${activeView !== "software" ? "hidden" : ""}`}>
+          <SoftwareInfo />
+        </div>
       </main>
       <Toaster position="top-right" richColors />
     </div>

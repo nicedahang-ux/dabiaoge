@@ -1,0 +1,14 @@
+[
+  {
+    "version": "0.2.0",
+    "date": "2026-04-26",
+    "notes": "优化表格处理功能，支持多表格与AI交互",
+    "filename": "AI表格转看板_0.2.0_x64-setup.nsis.zip"
+  },
+  {
+    "version": "0.1.0",
+    "date": "2026-04-26",
+    "notes": "初始版本发布",
+    "filename": "AI表格转看板_0.1.0_x64-setup.nsis.zip"
+  }
+]
