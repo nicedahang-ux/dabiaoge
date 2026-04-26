@@ -385,6 +385,233 @@ fn has_user_tables(conn: &rusqlite::Connection) -> Result<bool, String> {
     Ok(false)
 }
 
+const SYSTEM_TABLES: &[&str] = &[
+    "chat_sessions",
+    "dashboards",
+    "column_remarks",
+    "table_column_remarks",
+    "table_mappings",
+    "table_upload_mappings",
+    "bot_chat_memory",
+    "kb_chunks",
+    "kb_docs",
+    "app_config",
+    "table_remarks",
+    "dashboard_revisions",
+];
+
+fn list_business_tables(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = match conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+    {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0));
+    let mut out = vec![];
+    if let Ok(iter) = rows {
+        for r in iter.flatten() {
+            if !SYSTEM_TABLES.contains(&r.as_str()) && !r.starts_with("temp_") {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+/// 用主 AI 模型从用户消息中抽取候选关键词（货号/SKU/编号/品类等具体取值）
+/// 返回去重后的关键词列表；失败时返回空 Vec（不阻塞主流程）
+async fn extract_search_keywords(
+    client: &reqwest::Client,
+    config: &AppConfig,
+    content: &str,
+) -> Vec<String> {
+    let url = format!("{}/chat/completions", config.ai_url.trim_end_matches('/'));
+    let prompt = format!(
+        r#"从下面这段用户提问中，抽取出最可能用于在数据库里精确/模糊匹配的"具体取值"，比如货号、SKU、订单号、款式编码、店铺名、人名等。
+注意：
+- 只输出取值本身，不要输出字段名/类目词（如不要输出"销量"、"占比"、"店铺"这种词）。
+- 如果用户只说了数字（如"3458"），但常见货号格式带字母前缀（如 LDN3458），把字母前缀的全称也一并补出来。
+- 用 JSON 数组输出，最多 6 个，按相关性从高到低。如果没有任何具体取值，输出 []。
+
+用户提问: {}
+
+只输出 JSON 数组，不要任何额外说明。"#,
+        content
+    );
+
+    let body = json!({
+        "model": config.ai_model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+    });
+
+    let resp = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", config.ai_key))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+    let parsed: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let raw = parsed["choices"][0]["message"]["content"].as_str().unwrap_or("").trim();
+    // 容错：去掉可能的 markdown 围栏
+    let cleaned = raw.trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let arr: Vec<String> = serde_json::from_str(cleaned).unwrap_or_default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = vec![];
+    for kw in arr {
+        let k = kw.trim().to_string();
+        if k.is_empty() || k.len() > 64 { continue; }
+        if seen.insert(k.clone()) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// 把一个看板的 table_data（JSON 字符串）渲染成"前 N 行"的简洁 Markdown 表
+/// 只取前 20 行，避免上下文爆炸（与"附件上传规则"对齐）
+fn format_dashboard_table_preview(table_data_json: &str, max_rows: usize) -> String {
+    if table_data_json.trim().is_empty() {
+        return String::new();
+    }
+    let parsed: Vec<serde_json::Map<String, serde_json::Value>> =
+        match serde_json::from_str(table_data_json) {
+            Ok(v) => v,
+            Err(_) => return String::new(),
+        };
+    if parsed.is_empty() {
+        return String::new();
+    }
+    let cols: Vec<String> = parsed[0].keys().cloned().collect();
+    let total = parsed.len();
+    let mut lines = vec![cols.join(" | ")];
+    for row in parsed.iter().take(max_rows) {
+        let vals: Vec<String> = cols
+            .iter()
+            .map(|c| match row.get(c) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Number(n)) => n.to_string(),
+                Some(serde_json::Value::Bool(b)) => b.to_string(),
+                Some(serde_json::Value::Null) | None => String::new(),
+                Some(other) => other.to_string(),
+            })
+            .collect();
+        lines.push(vals.join(" | "));
+    }
+    if total > max_rows {
+        lines.push(format!("... 还有 {} 行未展示", total - max_rows));
+    }
+    lines.join("\n")
+}
+
+/// 反向模糊查询：对每个关键词在每张业务表的 TEXT 列上做 LIKE 探查
+/// 返回 (table_name, keyword, sample_row_text) 三元组，最多 limit 条
+fn reverse_fuzzy_search(
+    conn: &rusqlite::Connection,
+    keywords: &[String],
+    limit: usize,
+) -> Vec<(String, String, String)> {
+    if keywords.is_empty() {
+        return vec![];
+    }
+    let tables = list_business_tables(conn);
+    let mut results: Vec<(String, String, String)> = vec![];
+
+    for table in &tables {
+        // 取该表所有列名（用 scope 块释放 stmt 借用）
+        let text_cols: Vec<String> = {
+            let pragma = format!("PRAGMA table_info(\"{}\")", table);
+            let mut stmt = match conn.prepare(&pragma) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let col_rows = stmt.query_map([], |row| {
+                let name: String = row.get(1)?;
+                let typ: String = row.get(2).unwrap_or_default();
+                Ok((name, typ))
+            });
+            let mut cols: Vec<String> = vec![];
+            if let Ok(iter) = col_rows {
+                for r in iter.flatten() {
+                    let typ_upper = r.1.to_uppercase();
+                    // 文本类列（SQLite 类型亲和度宽松，TEXT/VARCHAR/CHAR/CLOB 都按文本处理）
+                    if typ_upper.contains("TEXT") || typ_upper.contains("CHAR") || typ_upper.contains("CLOB") || typ_upper.is_empty() {
+                        cols.push(r.0);
+                    }
+                }
+            }
+            cols
+        };
+        if text_cols.is_empty() {
+            continue;
+        }
+
+        for kw in keywords {
+            // 防 SQL 注入：关键词里只允许常见字符；其余跳过
+            if kw.chars().any(|c| c == '"' || c == '\'' || c == ';' || c == '\\') {
+                continue;
+            }
+            let where_parts: Vec<String> = text_cols
+                .iter()
+                .map(|c| format!("\"{}\" LIKE '%{}%'", c, kw))
+                .collect();
+            let sql = format!(
+                "SELECT * FROM \"{}\" WHERE {} LIMIT 1",
+                table,
+                where_parts.join(" OR ")
+            );
+            let row_text: Option<String> = {
+                let mut stmt2 = match conn.prepare(&sql) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let col_count = stmt2.column_count();
+                let col_names: Vec<String> = (0..col_count)
+                    .map(|i| stmt2.column_name(i).unwrap_or("?").to_string())
+                    .collect();
+                let mut rows = match stmt2.query([]) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        let mut pairs: Vec<String> = vec![];
+                        for i in 0..col_count {
+                            let val = match row.get_ref(i) {
+                                Ok(rusqlite::types::ValueRef::Null) => String::new(),
+                                Ok(rusqlite::types::ValueRef::Integer(n)) => n.to_string(),
+                                Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
+                                Ok(rusqlite::types::ValueRef::Text(s)) => String::from_utf8_lossy(s).to_string(),
+                                _ => String::new(),
+                            };
+                            pairs.push(format!("{}={}", col_names[i], val));
+                        }
+                        Some(pairs.join(", "))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(sample) = row_text {
+                results.push((table.clone(), kw.clone(), sample));
+                if results.len() >= limit {
+                    return results;
+                }
+            }
+        }
+    }
+    results
+}
+
 const MEMORY_EXPIRE_HOURS: i64 = 24;
 const ROUND_REMINDER_THRESHOLD: i32 = 3;
 
@@ -483,17 +710,18 @@ async fn handle_message(
     // 2. RAG: 检索相关表，并附带小白友好的看板信息
     let kb = crate::search_kb(app.clone(), content.to_string(), 3).await.unwrap_or_default();
 
-    // 查询所有看板（含描述和数据表），用于小白友好提示和智能路由
+    // 查询所有看板（含描述、数据表、计算后的明细 table_data），用于小白友好提示和智能路由
     #[derive(Debug, Clone)]
     struct DashInfo {
         id: String,
         name: String,
         description: String,
         source_table: String,
+        table_data: String,
     }
     let dashboards: Vec<DashInfo> = {
         let mut stmt = conn
-            .prepare("SELECT id, name, description, source_table FROM dashboards ORDER BY updated_at DESC LIMIT 10")
+            .prepare("SELECT id, name, description, source_table, table_data FROM dashboards ORDER BY updated_at DESC LIMIT 10")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -502,28 +730,65 @@ async fn handle_message(
                     name: row.get(1)?,
                     description: row.get(2).unwrap_or_default(),
                     source_table: row.get(3).unwrap_or_default(),
+                    table_data: row.get(4).unwrap_or_default(),
                 })
             })
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // 查询每个看板的预览数据（表头+第1行），帮助主模型理解看板内容
+    // 看板明细预览：优先用看板自身已计算好的 table_data（前 20 行），AI 直接看到现成结果，
+    // 不需要再去原始表里硬算交叉表
     let mut dashboard_previews: Vec<String> = vec![];
     for d in &dashboards {
-        if d.source_table.is_empty() {
-            continue;
+        let mut preview = format_dashboard_table_preview(&d.table_data, 20);
+        if preview.is_empty() && !d.source_table.is_empty() {
+            // 没有 table_data，退回原来的逻辑：取源表第 1 行
+            let preview_sql = format!(r#"SELECT * FROM "{}" LIMIT 1"#, d.source_table);
+            let raw = run_local_sql(&preview_sql).await;
+            if !raw.is_empty() && !raw.starts_with("SQL") && !raw.starts_with("查询失败") {
+                preview = raw;
+            }
         }
-        let preview_sql = format!(r#"SELECT * FROM "{}" LIMIT 1"#, d.source_table);
-        let preview = run_local_sql(&preview_sql).await;
-        if !preview.is_empty()
-            && !preview.starts_with("SQL")
-            && !preview.starts_with("查询失败")
-        {
+        if !preview.is_empty() {
             dashboard_previews.push(format!(
-                "【看板《{}》数据预览（表头+第1行）】\n{}",
+                "【看板《{}》明细数据预览（前 20 行）】\n{}",
                 d.name, preview
             ));
+        }
+    }
+
+    // 反向模糊查询：让 AI 抽取候选关键词，去原始表里 LIKE 探查，命中的表反查关联看板
+    let kw_client = reqwest::Client::new();
+    let keywords = extract_search_keywords(&kw_client, config, content).await;
+    let mut fuzzy_section = String::new();
+    if !keywords.is_empty() {
+        let hits = reverse_fuzzy_search(&conn, &keywords, 12);
+        if !hits.is_empty() {
+            // 命中的表 → 反查 dashboards 里 source_table 相同的看板
+            let mut hit_table_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (t, _, _) in &hits {
+                hit_table_set.insert(t.clone());
+            }
+            let related_boards: Vec<&DashInfo> = dashboards
+                .iter()
+                .filter(|d| hit_table_set.contains(&d.source_table))
+                .collect();
+
+            let mut buf = format!(
+                "🔎【反向模糊查询命中】基于关键词 [{}]，在以下原始表里找到相关数据：\n",
+                keywords.join("、")
+            );
+            for (t, kw, sample) in &hits {
+                buf.push_str(&format!("- 表 \"{}\" 命中关键词「{}」，样本行：{}\n", t, kw, sample));
+            }
+            if !related_boards.is_empty() {
+                buf.push_str("\n这些表关联了以下看板，可以**优先**从对应看板的明细数据里取答案：\n");
+                for d in &related_boards {
+                    buf.push_str(&format!("- 看板《{}》(数据表={})\n", d.name, d.source_table));
+                }
+            }
+            fuzzy_section = buf;
         }
     }
 
@@ -532,25 +797,27 @@ async fn handle_message(
         format!("- 看板《{}》：描述={}，数据表={}", d.name, d.description, d.source_table)
     }).collect::<Vec<_>>().join("\n");
 
-    let kb_hint = if kb.is_empty() {
+    let kb_hint = {
+        let mut parts: Vec<String> = vec![];
+        if !kb.is_empty() {
+            parts.push(format!("相关数据表信息:\n{}", kb.join("\n")));
+        }
+        if !fuzzy_section.is_empty() {
+            parts.push(fuzzy_section);
+        }
         if dashboard_names.is_empty() {
-            "当前知识库暂无相关表信息。".to_string()
+            if parts.is_empty() {
+                parts.push("当前知识库暂无相关表信息。".to_string());
+            }
         } else {
-            format!(
-                "目前系统里有这些看板可以查看：{}。你可以直接问我看某个看板的数据，或者上传新数据哦~\n\n看板详细信息（请根据用户问题，优先查询相关看板的数据表）：\n{}\n\n{}",
+            parts.push(format!(
+                "目前系统里的看板：{}\n\n看板详细信息（请根据用户问题，优先查询相关看板的数据表，并直接使用上面的明细数据预览作答）：\n{}\n\n{}",
                 dashboard_names.join("、"),
                 dashboard_details,
-                dashboard_previews.join("\n")
-            )
+                dashboard_previews.join("\n\n")
+            ));
         }
-    } else {
-        format!(
-            "相关数据表信息:\n{}\n\n目前系统里的看板：{}\n\n看板详细信息（请根据用户问题，优先查询相关看板的数据表）：\n{}\n\n{}",
-            kb.join("\n"),
-            dashboard_names.join("、"),
-            dashboard_details,
-            dashboard_previews.join("\n")
-        )
+        parts.join("\n\n")
     };
     messages.push(json!({"role": "system", "content": kb_hint}));
 
@@ -711,7 +978,7 @@ async fn handle_message(
         .filter(|m| {
             if let (Some(role), Some(content)) = (m.get("role").and_then(|v| v.as_str()), m.get("content").and_then(|v| v.as_str())) {
                 // 过滤掉 kb_hint（包含特定标记的临时 system message）
-                if role == "system" && (content.contains("相关数据表信息") || content.contains("目前系统里有这些看板") || content.contains("看板详细信息")) {
+                if role == "system" && (content.contains("相关数据表信息") || content.contains("目前系统里有这些看板") || content.contains("目前系统里的看板") || content.contains("看板详细信息") || content.contains("反向模糊查询命中")) {
                     return false;
                 }
             }

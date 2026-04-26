@@ -1,4 +1,4 @@
-import { BarChart3, Copy, Wrench, ArrowRight, Trash2 } from "lucide-react";
+import { BarChart3, Copy, Wrench, ArrowRight, Trash2, Package } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { toast } from "sonner";
@@ -9,6 +9,7 @@ interface DashboardCardProps {
   onView: (dashboard: Dashboard) => void;
   onModify: (dashboard: Dashboard) => void;
   onDelete?: (dashboard: Dashboard) => void;
+  onPack?: (dashboard: Dashboard) => void;
 }
 
 export default function DashboardCard({
@@ -16,6 +17,7 @@ export default function DashboardCard({
   onView,
   onModify,
   onDelete,
+  onPack,
 }: DashboardCardProps) {
   const handleCopyId = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -90,6 +92,20 @@ export default function DashboardCard({
             <Wrench className="h-3 w-3" />
             修改
           </Button>
+          {onPack && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1 text-xs text-blue-500 hover:text-blue-600 hover:bg-blue-50"
+              onClick={(e) => {
+                e.stopPropagation();
+                onPack(dashboard);
+              }}
+            >
+              <Package className="h-3 w-3" />
+              打包
+            </Button>
+          )}
           {onDelete && (
             <Button
               variant="ghost"

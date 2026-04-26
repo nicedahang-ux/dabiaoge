@@ -17,8 +17,18 @@ pub struct AppConfig {
     pub ding_app_secret: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct PersistedShareInfo {
+    pub board_id: String,
+    pub url: String,
+    pub pin: String,
+    pub port: u16,
+    pub allow_refresh: bool,
+}
+
 const STORE_PATH: &str = "app_config.bin";
 const STORE_KEY: &str = "config";
+const SHARE_STORE_KEY: &str = "share_status";
 
 fn app_store(app: &tauri::AppHandle) -> Result<std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, String> {
     tauri_plugin_store::StoreBuilder::new(app, STORE_PATH)
@@ -44,6 +54,66 @@ async fn load_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
         }
         None => Ok(AppConfig::default()),
     }
+}
+
+async fn save_share_status(app: tauri::AppHandle, info: PersistedShareInfo) -> Result<(), String> {
+    let store = app_store(&app)?;
+    store.set(SHARE_STORE_KEY, serde_json::to_value(&info).unwrap());
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn load_share_status(app: tauri::AppHandle) -> Result<Option<PersistedShareInfo>, String> {
+    let store = app_store(&app)?;
+    match store.get(SHARE_STORE_KEY) {
+        Some(v) => {
+            let info: PersistedShareInfo = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
+            Ok(Some(info))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn clear_share_status(app: tauri::AppHandle) -> Result<(), String> {
+    let store = app_store(&app)?;
+    store.delete(SHARE_STORE_KEY);
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn restart_share_server(
+    app: tauri::AppHandle,
+    board_id: String,
+    allow_refresh: bool,
+) -> Result<server::ShareInfo, String> {
+    let dashboard = get_dashboard(board_id.clone()).await?;
+    let board_data = serde_json::json!({
+        "id": dashboard.id,
+        "name": dashboard.name,
+        "description": dashboard.description,
+        "sql_template": dashboard.sql_template,
+        "ui_filters": dashboard.ui_filters,
+        "charts": dashboard.charts,
+        "table_data": dashboard.table_data,
+        "source_table": dashboard.source_table,
+        "actions": dashboard.actions,
+        "summary_cards": dashboard.summary_cards,
+        "html_content": dashboard.html_content,
+    });
+    // 复用持久化的 PIN，让对方设备保存的提取码继续有效
+    let existing_pin = load_share_status(app.clone()).await.ok().flatten()
+        .filter(|s| s.board_id == board_id)
+        .map(|s| s.pin);
+    let info = server::start_share_server(board_id.clone(), allow_refresh, board_data, existing_pin).await?;
+    let persisted = PersistedShareInfo {
+        board_id,
+        url: info.url.clone(),
+        pin: info.pin.clone(),
+        port: info.url.split(':').nth(2).and_then(|s| s.split('/').next()?.parse().ok()).unwrap_or(8080),
+        allow_refresh,
+    };
+    let _ = save_share_status(app, persisted).await;
+    Ok(info)
 }
 
 #[tauri::command]
@@ -3078,6 +3148,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[tauri::command]
 async fn start_share_server(
+    app: tauri::AppHandle,
     board_id: String,
     allow_refresh: bool,
 ) -> Result<server::ShareInfo, String> {
@@ -3090,9 +3161,301 @@ async fn start_share_server(
         "ui_filters": dashboard.ui_filters,
         "charts": dashboard.charts,
         "table_data": dashboard.table_data,
+        "source_table": dashboard.source_table,
+        "actions": dashboard.actions,
+        "summary_cards": dashboard.summary_cards,
+        "html_content": dashboard.html_content,
     });
-    server::start_share_server(board_id, allow_refresh, board_data)
-        .await
+    let info = server::start_share_server(board_id.clone(), allow_refresh, board_data, None).await?;
+    let persisted = PersistedShareInfo {
+        board_id,
+        url: info.url.clone(),
+        pin: info.pin.clone(),
+        port: info.url.split(':').nth(2).and_then(|s| s.split('/').next()?.parse().ok()).unwrap_or(8080),
+        allow_refresh,
+    };
+    let _ = save_share_status(app, persisted).await;
+    Ok(info)
+}
+
+#[tauri::command]
+async fn stop_share_server(app: tauri::AppHandle) -> Result<(), String> {
+    server::stop_share_server().await?;
+    clear_share_status(app).await?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_share_status(app: tauri::AppHandle) -> Result<Option<PersistedShareInfo>, String> {
+    // 先查内存
+    let mem_status = server::get_share_status().await?;
+    if let Some(mem) = mem_status {
+        return Ok(Some(PersistedShareInfo {
+            board_id: mem.board_id,
+            url: mem.url,
+            pin: mem.pin,
+            port: mem.port,
+            allow_refresh: mem.allow_refresh,
+        }));
+    }
+    // 内存没有，查持久化
+    load_share_status(app).await
+}
+
+// ========== Dashboard Pack / Import ==========
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ColumnDef {
+    pub name: String,
+    pub type_name: String,
+    pub notnull: bool,
+    pub dflt_value: Option<String>,
+    pub pk: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TablePack {
+    pub original_name: String,
+    pub columns: Vec<ColumnDef>,
+    pub rows: Vec<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DashboardPack {
+    pub version: String,
+    pub dashboard: Dashboard,
+    pub table_data: Option<TablePack>,
+}
+
+#[tauri::command]
+async fn pack_dashboard(dashboard_id: String) -> Result<String, String> {
+    let dashboard = get_dashboard(dashboard_id.clone()).await?;
+
+    let source_table = dashboard.source_table.clone();
+
+    let table_pack = if let Some(ref table_name) = source_table {
+        let conn = init_db()?;
+
+        // 获取表结构
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", table_name))
+            .map_err(|e| e.to_string())?;
+        let col_rows = stmt.query_map([], |row| {
+            Ok(ColumnDef {
+                name: row.get(1)?,
+                type_name: row.get(2)?,
+                notnull: row.get::<_, i32>(3)? != 0,
+                dflt_value: row.get(4)?,
+                pk: row.get::<_, i32>(5)? != 0,
+            })
+        }).map_err(|e| e.to_string())?;
+
+        let mut columns = vec![];
+        for row in col_rows {
+            columns.push(row.map_err(|e| e.to_string())?);
+        }
+        drop(stmt);
+
+        // 获取所有数据
+        let mut stmt = conn
+            .prepare(&format!(r#"SELECT * FROM "{}""#, table_name))
+            .map_err(|e| e.to_string())?;
+        let col_count = columns.len();
+        let rows = stmt.query_map([], move |row| {
+            let mut vals: Vec<String> = vec![];
+            for i in 0..col_count {
+                let val_ref = row.get_ref(i)?;
+                let val: String = match val_ref {
+                    rusqlite::types::ValueRef::Null => String::new(),
+                    rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+                    rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                    rusqlite::types::ValueRef::Text(s) => String::from_utf8_lossy(s).to_string(),
+                    rusqlite::types::ValueRef::Blob(_) => "<BLOB>".to_string(),
+                };
+                vals.push(val);
+            }
+            Ok(vals)
+        }).map_err(|e| e.to_string())?;
+
+        let mut data_rows = vec![];
+        for row in rows {
+            data_rows.push(row.map_err(|e| e.to_string())?);
+        }
+
+        Some(TablePack {
+            original_name: table_name.clone(),
+            columns,
+            rows: data_rows,
+        })
+    } else {
+        None
+    };
+
+    let pack = DashboardPack {
+        version: "1.0".to_string(),
+        dashboard,
+        table_data: table_pack,
+    };
+
+    let json = serde_json::to_string_pretty(&pack).map_err(|e| e.to_string())?;
+
+    let download_dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .ok_or("无法获取下载目录")?;
+
+    let file_name = format!("dashboard_pack_{}.json", dashboard_id);
+    let file_path = download_dir.join(&file_name);
+    std::fs::write(&file_path, json).map_err(|e| e.to_string())?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+fn find_available_table_name(conn: &rusqlite::Connection, base_name: &str) -> Result<String, String> {
+    let exists: bool = conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [base_name],
+        |_| Ok(true),
+    ).unwrap_or(false);
+
+    if !exists {
+        return Ok(base_name.to_string());
+    }
+
+    let mut suffix = 1;
+    loop {
+        let candidate = format!("{}_{}", base_name, suffix);
+        let exists: bool = conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [&candidate],
+            |_| Ok(true),
+        ).unwrap_or(false);
+
+        if !exists {
+            return Ok(candidate);
+        }
+        suffix += 1;
+
+        if suffix > 1000 {
+            return Err("无法找到可用的表名".to_string());
+        }
+    }
+}
+
+fn replace_table_name_in_sql(sql: &str, old_name: &str, new_name: &str) -> String {
+    let pattern = format!(r#"\b{}\b"#, regex::escape(old_name));
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(sql, new_name).to_string()
+}
+
+#[tauri::command]
+async fn import_dashboard_pack(file_path: String) -> Result<String, String> {
+    let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+    let pack: DashboardPack = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+
+    let conn = init_db()?;
+
+    // 1. 检查并自动重命名表
+    let final_table_name = if let Some(ref table_pack) = pack.table_data {
+        let original_name = &table_pack.original_name;
+        let available_name = find_available_table_name(&conn, original_name)?;
+
+        if available_name != *original_name {
+            println!("[import] 表名 {} 已存在，重命名为 {}", original_name, available_name);
+        }
+
+        // 2. 创建新表
+        let cols_def = table_pack.columns.iter().map(|c| {
+            let default = match &c.dflt_value {
+                Some(d) => format!(" DEFAULT '{}'", d),
+                None => String::new(),
+            };
+            let notnull = if c.notnull { " NOT NULL" } else { "" };
+            format!("{} {}{}{}", c.name, c.type_name, notnull, default)
+        }).collect::<Vec<_>>().join(", ");
+
+        let pk_cols: Vec<String> = table_pack.columns.iter()
+            .filter(|c| c.pk)
+            .map(|c| c.name.clone())
+            .collect();
+
+        let pk_clause = if !pk_cols.is_empty() {
+            format!(", PRIMARY KEY ({})", pk_cols.join(", "))
+        } else {
+            String::new()
+        };
+
+        let create_sql = format!(
+            r#"CREATE TABLE "{}" ({}{})"#,
+            available_name, cols_def, pk_clause
+        );
+        conn.execute(&create_sql, []).map_err(|e| e.to_string())?;
+
+        // 3. 插入数据（使用事务批量插入）
+        let placeholders = table_pack.columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let insert_sql = format!(
+            r#"INSERT INTO "{}" ({}) VALUES ({})"#,
+            available_name,
+            table_pack.columns.iter().map(|c| format!("\"{}\"", c.name)).collect::<Vec<_>>().join(", "),
+            placeholders
+        );
+
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx.prepare(&insert_sql).map_err(|e| e.to_string())?;
+            for row in &table_pack.rows {
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    row.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+                stmt.execute(params.as_slice()).map_err(|e| e.to_string())?;
+            }
+            drop(stmt);
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+
+        Some(available_name)
+    } else {
+        None
+    };
+
+    // 4. 插入看板记录，生成新ID
+    let new_dashboard_id = Uuid::new_v4().to_string();
+    let mut dashboard = pack.dashboard;
+    dashboard.id = new_dashboard_id.clone();
+
+    // 5. 替换 sql_template 和 html_content 中的旧表名
+    if let Some(ref old_table) = pack.table_data {
+        if let Some(ref new_table) = final_table_name {
+            if let Some(ref mut sql) = dashboard.sql_template {
+                *sql = replace_table_name_in_sql(sql, &old_table.original_name, new_table);
+            }
+            if let Some(ref mut html) = dashboard.html_content {
+                *html = replace_table_name_in_sql(html, &old_table.original_name, new_table);
+            }
+        }
+    }
+
+    // 更新 source_table
+    if final_table_name.is_some() {
+        dashboard.source_table = final_table_name;
+    }
+
+    conn.execute(
+        "INSERT INTO dashboards (id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))",
+        rusqlite::params![
+            dashboard.id,
+            dashboard.name,
+            dashboard.description,
+            dashboard.sql_template,
+            dashboard.ui_filters,
+            dashboard.charts,
+            dashboard.table_data,
+            dashboard.source_table,
+            dashboard.actions,
+            dashboard.summary_cards,
+            dashboard.html_content,
+        ],
+    ).map_err(|e| e.to_string())?;
+
+    Ok(new_dashboard_id)
 }
 
 #[tauri::command]
@@ -4006,6 +4369,19 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--flag1", "--flag2"])))
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Some(status)) = load_share_status(app_handle.clone()).await {
+                    println!("[startup] 发现之前分享的看板，正在恢复: {}", status.board_id);
+                    if let Err(e) = restart_share_server(app_handle.clone(), status.board_id, status.allow_refresh).await {
+                        eprintln!("[startup] 恢复分享服务器失败: {}", e);
+                        let _ = clear_share_status(app_handle).await;
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             save_config,
             load_config,
@@ -4021,6 +4397,8 @@ pub fn run() {
             query_table_data,
             drop_user_table,
             start_share_server,
+            stop_share_server,
+            get_share_status,
             start_bot,
             get_bot_status,
             create_session,
@@ -4057,6 +4435,8 @@ pub fn run() {
             log_to_terminal,
             render_html_dashboard,
             check_refresh_signals,
+            pack_dashboard,
+            import_dashboard_pack,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

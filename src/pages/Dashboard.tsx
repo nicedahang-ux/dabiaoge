@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ReactECharts from "echarts-for-react";
 import { toPng } from "html-to-image";
+import * as XLSX from "xlsx";
 import {
   BarChart3,
   PieChart,
@@ -16,6 +17,7 @@ import {
   Loader2,
   Plus,
   Download,
+  Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -375,6 +377,37 @@ export default function DashboardPage() {
     }
   };
 
+  const handlePackDashboard = async (dashboard: Dashboard) => {
+    try {
+      const filePath = await invoke<string>("pack_dashboard", {
+        dashboardId: dashboard.id,
+      });
+      toast.success(`看板已打包: ${filePath}`);
+    } catch (e) {
+      toast.error("打包失败: " + String(e));
+    }
+  };
+
+  const handleImportDashboard = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "看板包", extensions: ["json"] }],
+      });
+      if (!selected) return;
+
+      const newId = await invoke<string>("import_dashboard_pack", {
+        filePath: selected,
+      });
+      toast.success("看板导入成功");
+      refreshDashboards();
+      setBoardsSelectedId(newId);
+    } catch (e) {
+      toast.error("导入失败: " + String(e));
+    }
+  };
+
   const handleScreenshot = async () => {
     if (!dashboardDetailRef.current || !selectedDashboard) return;
     try {
@@ -560,6 +593,23 @@ export default function DashboardPage() {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportExcel = () => {
+    if (tableData.length === 0) return;
+    const headers = Object.keys(tableData[0]);
+    const rows = tableData.map((row) =>
+      headers.map((h) => row[h] ?? "")
+    );
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    const colWidths = headers.map((h) => ({
+      wch: Math.max(h.length, 12),
+    }));
+    ws['!cols'] = colWidths;
+    XLSX.utils.book_append_sheet(wb, ws, "数据");
+    const fileName = `${selectedDashboard?.name || "export"}.xlsx`;
+    XLSX.writeFile(wb, fileName);
+  };
+
   return (
     <div className="flex flex-col h-full overflow-auto"
     >
@@ -574,13 +624,22 @@ export default function DashboardPage() {
             >
           </div
           >
-          <button
-            onClick={() => setCreateOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-md text-sm hover:bg-blue-700"
-          >
-            <Plus className="h-4 w-4" />
-            创建看板
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleImportDashboard}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-slate-200 text-slate-700 rounded-md text-sm hover:bg-slate-50"
+            >
+              <Upload className="h-4 w-4" />
+              导入看板
+            </button>
+            <button
+              onClick={() => setCreateOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-md text-sm hover:bg-blue-700"
+            >
+              <Plus className="h-4 w-4" />
+              创建看板
+            </button>
+          </div>
         </div
         >
 
@@ -619,6 +678,7 @@ export default function DashboardPage() {
                 dashboard={dashboard}
                 onView={handleViewDashboard}
                 onModify={handleModifyDashboard}
+                onPack={handlePackDashboard}
                 onDelete={(d) => {
                   setDeletingDashboard(d);
                   setDeleteMode("dashboard");
@@ -782,6 +842,14 @@ export default function DashboardPage() {
                         className="inline-flex items-center gap-1 px-2 py-1 border rounded-md text-xs hover:bg-slate-50"
                       >
                         <Download className="h-3 w-3" /> 导出 CSV
+                      </button>
+                    )}
+                    {parsedActions.includes("export_excel") && (
+                      <button
+                        onClick={handleExportExcel}
+                        className="inline-flex items-center gap-1 px-2 py-1 border rounded-md text-xs hover:bg-slate-50"
+                      >
+                        <Download className="h-3 w-3" /> 导出 Excel
                       </button>
                     )}
                   </div>

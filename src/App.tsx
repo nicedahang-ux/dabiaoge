@@ -33,6 +33,28 @@ function ShareButton() {
   } | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // 组件挂载时查询当前分享状态
+  useEffect(() => {
+    async function checkStatus() {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const status = await invoke<{
+          board_id: string;
+          url: string;
+          pin: string;
+        } | null>("get_share_status");
+        if (status && status.board_id === boardsSelectedId) {
+          setShareInfo({ url: status.url, pin: status.pin });
+        } else {
+          setShareInfo(null);
+        }
+      } catch {
+        // 静默失败
+      }
+    }
+    checkStatus();
+  }, [boardsSelectedId]);
+
   const handleShare = async () => {
     if (!boardsSelectedId) {
       toast.error("请先选择一个看板");
@@ -48,6 +70,17 @@ function ShareButton() {
         }
       );
       setShareInfo(info);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const handleStopShare = async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("stop_share_server");
+      setShareInfo(null);
+      toast.success("分享已停止");
     } catch (e) {
       toast.error(String(e));
     }
@@ -93,6 +126,14 @@ function ShareButton() {
                   )}
                 </Button>
               </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full text-red-500 hover:text-red-600 hover:bg-red-50"
+                onClick={handleStopShare}
+              >
+                停止分享
+              </Button>
             </div>
           )}
         </div>
