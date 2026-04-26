@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/popover";
 import { toast } from "sonner";
 import { AppProvider, useApp } from "@/lib/AppContext";
+import { invalidateBySourceTable } from "@/lib/dashboardHtmlCache";
 import SettingsPage from "./pages/Settings";
 import WorkbenchPage from "./pages/Workbench";
 import DashboardPage from "./pages/Dashboard";
@@ -116,6 +117,35 @@ function MainLayout() {
       }
     }
     autoStartBot();
+  }, []);
+
+  // 轮询检测外部Python入库后的刷新信号
+  useEffect(() => {
+    let cancelled = false;
+
+    async function pollRefreshSignals() {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const tableNames = await invoke<string[]>("check_refresh_signals");
+        if (cancelled) return;
+
+        if (tableNames.length > 0) {
+          for (const tableName of tableNames) {
+            invalidateBySourceTable(tableName);
+          }
+          toast.info(`检测到外部数据更新，已自动刷新 ${tableNames.length} 个关联看板`);
+        }
+      } catch {
+        // 静默失败，避免轮询报错打扰用户
+      }
+    }
+
+    pollRefreshSignals();
+    const interval = setInterval(pollRefreshSignals, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
   return (

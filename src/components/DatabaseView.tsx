@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { invalidateBySourceTable } from "@/lib/dashboardHtmlCache";
 import {
   Database,
   Table2,
@@ -22,6 +23,8 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronLeft,
+  ChevronsRight,
+  Shield,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -70,6 +73,18 @@ interface DashboardInfo {
   sql_template?: string;
 }
 
+const SYSTEM_TABLES: Record<string, { label: string; description: string }> = {
+  chat_sessions: { label: "系统", description: "AI对话记录" },
+  kb_docs: { label: "系统", description: "知识库文档" },
+  bot_chat_memory: { label: "系统", description: "钉钉机器人记忆" },
+  dashboards: { label: "系统", description: "看板配置" },
+  table_column_remarks: { label: "系统", description: "字段备注配置" },
+  table_upload_mappings: { label: "系统", description: "表格上传映射配置" },
+  dashboard_revisions: { label: "系统", description: "看板版本历史" },
+  table_remarks: { label: "系统", description: "表备注配置" },
+  _detabu_refresh_signals: { label: "系统", description: "刷新信号队列" },
+};
+
 export default function DatabaseView() {
   const [tables, setTables] = useState<string[]>([]);
   const [selectedTable, setSelectedTable] = useState<string>("");
@@ -108,6 +123,7 @@ export default function DatabaseView() {
   const PAGE_SIZE = 30;
   const [schemaExpanded, setSchemaExpanded] = useState(false);
   const [page, setPage] = useState(1);
+  const [jumpPageInput, setJumpPageInput] = useState("");
 
   const loadTables = async () => {
     setRefreshing(true);
@@ -188,6 +204,7 @@ export default function DatabaseView() {
     if (!deleteTable) return;
     try {
       await invoke("drop_user_table", { tableName: deleteTable });
+      invalidateBySourceTable(deleteTable);
       toast.success(`表 ${deleteTable} 已删除`);
       setTables((prev) => prev.filter((t) => t !== deleteTable));
       if (selectedTable === deleteTable) {
@@ -244,6 +261,7 @@ export default function DatabaseView() {
         primaryKey: pkName,
         primaryValue: pkValue,
       });
+      invalidateBySourceTable(selectedTable);
       toast.success("修改已保存");
       const updated = { ...data };
       updated.rows = updated.rows.map((r, i) =>
@@ -326,6 +344,7 @@ export default function DatabaseView() {
       if (updated === 0) {
         toast.warning("没有行被更新，请检查主键值是否正确");
       } else {
+        invalidateBySourceTable(selectedTable);
         toast.success(`成功更新 ${updated} 行`);
       }
       setBatchOpen(false);
@@ -375,6 +394,8 @@ export default function DatabaseView() {
                   d.source_table === table ||
                   (d.sql_template && d.sql_template.includes(table))
               );
+              const sysInfo = SYSTEM_TABLES[table];
+              const isSystem = !!sysInfo;
               return (
                 <button
                   key={table}
@@ -391,37 +412,56 @@ export default function DatabaseView() {
                   <div className="flex items-center gap-2 w-full">
                     <Table2 className="h-4 w-4 flex-shrink-0" />
                     <span className="flex-1 text-left truncate">{table}</span>
-                    {tableRemarks[table] && (
-                      <span className="text-[10px] text-slate-400 italic truncate max-w-[120px]">
-                        {tableRemarks[table]}
+                    {isSystem ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] text-red-600 font-medium">
+                        <Shield className="h-3 w-3" />
+                        {sysInfo.label}
                       </span>
+                    ) : (
+                      tableRemarks[table] && (
+                        <span className="text-[10px] text-slate-400 italic truncate max-w-[120px]">
+                          {tableRemarks[table]}
+                        </span>
+                      )
                     )}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-slate-600 hover:bg-slate-100"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setTableRemarkTarget(table);
-                        setTableRemarkValue(tableRemarks[table] || "");
-                        setTableRemarkOpen(true);
-                      }}
-                    >
-                      <Pencil className="h-3 w-3" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-600 hover:bg-red-50"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        confirmDelete(table);
-                      }}
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </Button>
+                    {!isSystem && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setTableRemarkTarget(table);
+                            setTableRemarkValue(tableRemarks[table] || "");
+                            setTableRemarkOpen(true);
+                          }}
+                        >
+                          <Pencil className="h-3 w-3" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-600 hover:bg-red-50"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            confirmDelete(table);
+                          }}
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </Button>
+                      </>
+                    )}
                   </div>
-                  {linked.length > 0 && (
+                  {isSystem && (
+                    <div className="flex items-center gap-1 pl-6">
+                      <Shield className="h-3 w-3 text-red-500" />
+                      <span className="text-[10px] text-red-500 truncate">
+                        {sysInfo.description}（系统表，不可删除）
+                      </span>
+                    </div>
+                  )}
+                  {!isSystem && linked.length > 0 && (
                     <div className="flex items-center gap-1 pl-6">
                       <BarChart3 className="h-3 w-3 text-amber-500" />
                       <span className="text-[10px] text-slate-400 truncate">
@@ -460,12 +500,16 @@ export default function DatabaseView() {
               <Button variant="outline" size="sm" onClick={loadTableDetail}>
                 <RefreshCw className="mr-1 h-3 w-3" /> 刷新
               </Button>
-              <Button variant="outline" size="sm" onClick={() => setUploadOpen(true)}>
-                <Upload className="mr-1 h-3 w-3" /> 上传表格
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setCodeOpen(true)}>
-                <Code className="mr-1 h-3 w-3" /> Python代码
-              </Button>
+              {!SYSTEM_TABLES[selectedTable] && (
+                <Button variant="outline" size="sm" onClick={() => setUploadOpen(true)}>
+                  <Upload className="mr-1 h-3 w-3" /> 上传表格
+                </Button>
+              )}
+              {!SYSTEM_TABLES[selectedTable] && (
+                <Button variant="outline" size="sm" onClick={() => setCodeOpen(true)}>
+                  <Code className="mr-1 h-3 w-3" /> Python代码
+                </Button>
+              )}
               {selectedRows.size > 0 && (
                 <>
                   <Button variant="outline" size="sm" onClick={() => setBatchOpen(true)}>
@@ -747,6 +791,42 @@ export default function DatabaseView() {
                     >
                       下一页
                       <ChevronRight className="h-3 w-3" />
+                    </Button>
+                    <div className="flex items-center gap-1">
+                      <span className="text-slate-400">前往</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={Math.max(1, Math.ceil(data.total_count / PAGE_SIZE))}
+                        className="w-12 h-7 rounded border border-input bg-transparent px-1 py-0.5 text-xs text-center"
+                        placeholder="页码"
+                        value={jumpPageInput}
+                        onChange={(e) => setJumpPageInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            const target = parseInt(jumpPageInput, 10);
+                            const totalPages = Math.max(1, Math.ceil(data.total_count / PAGE_SIZE));
+                            if (!isNaN(target) && target >= 1 && target <= totalPages) {
+                              setPage(target);
+                              setJumpPageInput("");
+                            } else {
+                              toast.error(`请输入 1-${totalPages} 之间的页码`);
+                            }
+                          }
+                        }}
+                      />
+                      <span className="text-slate-400">页</span>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2"
+                      onClick={() =>
+                        setPage(Math.max(1, Math.ceil(data.total_count / PAGE_SIZE)))
+                      }
+                    >
+                      尾页
+                      <ChevronsRight className="h-3 w-3 ml-0.5" />
                     </Button>
                   </div>
                 </div>

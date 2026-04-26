@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FileUp, Upload, X, Loader2, Save, BookOpen } from "lucide-react";
+import { FileUp, Upload, X, Loader2, Save, BookOpen, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
+import { invalidateBySourceTable } from "@/lib/dashboardHtmlCache";
 
 interface ColumnInfo {
   cid: number;
@@ -64,6 +65,7 @@ export default function TableUploadModal({
   const [autoClean, setAutoClean] = useState(true);
   const [useSaved, setUseSaved] = useState(false);
   const [remarks, setRemarks] = useState<Record<string, string>>({});
+  const [autoMatchedCount, setAutoMatchedCount] = useState(0);
 
   useEffect(() => {
     if (!modalOpen) {
@@ -74,24 +76,58 @@ export default function TableUploadModal({
     }
   }, [modalOpen]);
 
+  // 智能字段匹配：表头 ↔ db 列名 / 中文备注 双向匹配
   useEffect(() => {
     if (sheets.length > 0 && schema.length > 0 && !useSaved) {
-      const autoMappings: ColumnMapping[] = [];
       const sheetCols = sheets[selectedSheet]?.columns || [];
-      for (const dbCol of schema) {
-        const match = sheetCols.find(
-          (sc) =>
-            sc.toLowerCase().trim() === dbCol.name.toLowerCase().trim() ||
-            sc.toLowerCase().trim().includes(dbCol.name.toLowerCase().trim()) ||
-            dbCol.name.toLowerCase().trim().includes(sc.toLowerCase().trim())
-        );
-        if (match) {
-          autoMappings.push({ excel_col: match, db_col: dbCol.name });
+      const norm = (s: string) =>
+        (s || "")
+          .trim()
+          .toLowerCase()
+          // 全角转半角
+          .replace(/[！-～]/g, (c) =>
+            String.fromCharCode(c.charCodeAt(0) - 0xFEE0)
+          )
+          // 去掉中英文标点和空白
+          .replace(/[\s,，.。;；:：()（）\-_/\\|]/g, "");
+
+      const usedExcel = new Set<string>();
+      const tryMatch = (
+        candidate: string,
+        target: string,
+        mode: "exact" | "contains"
+      ): boolean => {
+        const a = norm(candidate);
+        const b = norm(target);
+        if (!a || !b) return false;
+        if (mode === "exact") return a === b;
+        if (a.length < 2 || b.length < 2) return false;
+        return a.includes(b) || b.includes(a);
+      };
+
+      const result: ColumnMapping[] = [];
+      // 4 级优先级：精确名 → 精确备注 → 包含名 → 包含备注
+      for (const tier of ["exact-name", "exact-remark", "contains-name", "contains-remark"] as const) {
+        for (const dbCol of schema) {
+          if (result.some((m) => m.db_col === dbCol.name)) continue;
+          const remark = remarks[dbCol.name] || "";
+          for (const sc of sheetCols) {
+            if (usedExcel.has(sc)) continue;
+            const target =
+              tier === "exact-name" || tier === "contains-name" ? dbCol.name : remark;
+            const mode = tier.startsWith("exact") ? "exact" : "contains";
+            if (tryMatch(sc, target, mode)) {
+              result.push({ excel_col: sc, db_col: dbCol.name });
+              usedExcel.add(sc);
+              break;
+            }
+          }
         }
       }
-      setMappings(autoMappings);
+      setMappings(result);
+      setAutoMatchedCount(result.length);
     }
-  }, [sheets, selectedSheet, schema, useSaved]);
+  }, [sheets, selectedSheet, schema, useSaved, remarks]);
 
   const resetState = () => {
     setFilePath("");
@@ -178,6 +214,7 @@ export default function TableUploadModal({
         skipHeader: true,
         useSavedMappings: useSaved,
       });
+      invalidateBySourceTable(tableName);
       toast.success(`成功导入 ${inserted} 行数据`);
       onSuccess();
       onOpenChange(false);
@@ -330,6 +367,13 @@ export default function TableUploadModal({
                       </Button>
                     </div>
                   </div>
+
+                  {autoMatchedCount > 0 && (
+                    <div className="flex items-center gap-2 bg-emerald-50 text-emerald-700 px-3 py-2 rounded-md text-xs">
+                      <Sparkles className="h-3.5 w-3.5" />
+                      已根据表头与字段中文备注自动匹配 {autoMatchedCount} 列，可在下方调整后点击"保存为默认映射"
+                    </div>
+                  )}
 
                   {mappings.length === 0 && (
                     <div className="text-center py-4 text-sm text-slate-400 bg-slate-50 rounded-md">

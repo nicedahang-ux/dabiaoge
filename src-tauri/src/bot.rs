@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 
-use crate::{init_db, load_config, AppConfig};
+use crate::{init_db, load_config, resolve_query_model, AppConfig};
 
 static BOT_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -42,6 +42,10 @@ const BOT_SYSTEM_PROMPT: &str = r#"你是企业数据助手"小妮"，专门帮�
 - 数据结果用 Markdown 表格呈现，表格上面加一句简单说明。
 - 如果某个表关联了数据看板，主动告诉用户："这个问题在看板《XXX》里也能看到可视化图表哦~"
 - 保持语气亲切、活泼，适当加 emoji。
+
+看板优先规则：
+- 如果用户问题明显与某个数据看板相关（例如问到了看板里的款号、编码、销售额、搭配等），请优先查询该看板关联的数据表来回答。
+- 查询不到时，再查其他表。
 
 举例：
 - 不要这样说："表 sales 包含 quantity 字段，使用 SELECT SUM..."
@@ -474,42 +478,96 @@ async fn handle_message(
     // 2. RAG: 检索相关表，并附带小白友好的看板信息
     let kb = crate::search_kb(app.clone(), content.to_string(), 3).await.unwrap_or_default();
 
-    // 查询所有看板，用于小白友好提示
-    let dashboard_list: Vec<String> = {
+    // 查询所有看板（含描述和数据表），用于小白友好提示和智能路由
+    #[derive(Debug, Clone)]
+    struct DashInfo {
+        id: String,
+        name: String,
+        description: String,
+        source_table: String,
+    }
+    let dashboards: Vec<DashInfo> = {
         let mut stmt = conn
-            .prepare("SELECT name FROM dashboards ORDER BY updated_at DESC LIMIT 10")
+            .prepare("SELECT id, name, description, source_table FROM dashboards ORDER BY updated_at DESC LIMIT 10")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
-                let name: String = row.get(0)?;
-                Ok(name)
+                Ok(DashInfo {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2).unwrap_or_default(),
+                    source_table: row.get(3).unwrap_or_default(),
+                })
             })
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    // 查询每个看板的预览数据（表头+第1行），帮助主模型理解看板内容
+    let mut dashboard_previews: Vec<String> = vec![];
+    for d in &dashboards {
+        if d.source_table.is_empty() {
+            continue;
+        }
+        let preview_sql = format!(r#"SELECT * FROM "{}" LIMIT 1"#, d.source_table);
+        let preview = run_local_sql(&preview_sql).await;
+        if !preview.is_empty()
+            && !preview.starts_with("SQL")
+            && !preview.starts_with("查询失败")
+        {
+            dashboard_previews.push(format!(
+                "【看板《{}》数据预览（表头+第1行）】\n{}",
+                d.name, preview
+            ));
+        }
+    }
+
+    let dashboard_names: Vec<String> = dashboards.iter().map(|d| d.name.clone()).collect();
+    let dashboard_details = dashboards.iter().map(|d| {
+        format!("- 看板《{}》：描述={}，数据表={}", d.name, d.description, d.source_table)
+    }).collect::<Vec<_>>().join("\n");
+
     let kb_hint = if kb.is_empty() {
-        if dashboard_list.is_empty() {
+        if dashboard_names.is_empty() {
             "当前知识库暂无相关表信息。".to_string()
         } else {
-            format!("目前系统里有这些看板可以查看：{}。你可以直接问我看某个看板的数据，或者上传新数据哦~", dashboard_list.join("、"))
+            format!(
+                "目前系统里有这些看板可以查看：{}。你可以直接问我看某个看板的数据，或者上传新数据哦~\n\n看板详细信息（请根据用户问题，优先查询相关看板的数据表）：\n{}\n\n{}",
+                dashboard_names.join("、"),
+                dashboard_details,
+                dashboard_previews.join("\n")
+            )
         }
     } else {
-        format!("相关数据表信息:\n{}\n\n目前系统里的看板：{}", kb.join("\n"), dashboard_list.join("、"))
+        format!(
+            "相关数据表信息:\n{}\n\n目前系统里的看板：{}\n\n看板详细信息（请根据用户问题，优先查询相关看板的数据表）：\n{}\n\n{}",
+            kb.join("\n"),
+            dashboard_names.join("、"),
+            dashboard_details,
+            dashboard_previews.join("\n")
+        )
     };
     messages.push(json!({"role": "system", "content": kb_hint}));
 
-    // 3. Tool Call 循环
+    // 3. 查询迭代阶段（查询模型，最多10轮）
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", config.ai_url.trim_end_matches('/'));
-    let mut max_rounds = 3;
-    let mut final_reply = String::new();
+    let query_model_str = resolve_query_model(config);
+    let mut query_messages = messages.clone();
+    let mut query_history: Vec<String> = vec![];
+    let mut query_rounds = 10;
 
-    while max_rounds > 0 {
-        max_rounds -= 1;
+    while query_rounds > 0 {
+        query_rounds -= 1;
+        // 第1轮用主模型做规划和首次查询，后续轮次用查询模型迭代
+        let round_model = if query_history.is_empty() {
+            config.ai_model.clone()
+        } else {
+            query_model_str.clone()
+        };
         let req_body = ToolCallRequest {
-            model: config.ai_model.clone(),
-            messages: messages.clone(),
+            model: round_model,
+            messages: query_messages.clone(),
             tools: vec![json!({
                 "type": "function",
                 "function": {
@@ -541,7 +599,7 @@ async fn handle_message(
 
         if finish_reason == "tool_calls" {
             let tool_calls = choice["message"]["tool_calls"].as_array().cloned().unwrap_or_default();
-            messages.push(choice["message"].clone());
+            query_messages.push(choice["message"].clone());
 
             for call in tool_calls {
                 if let Some(func) = call.get("function") {
@@ -551,7 +609,8 @@ async fn handle_message(
                         let sql: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
                         let sql_str = sql["sql"].as_str().unwrap_or("");
                         let result = run_local_sql(sql_str).await;
-                        messages.push(json!({
+                        query_history.push(format!("SQL: {}\n结果: {}", sql_str, result));
+                        query_messages.push(json!({
                             "role": "tool",
                             "tool_call_id": call["id"].as_str().unwrap_or(""),
                             "content": result
@@ -560,17 +619,64 @@ async fn handle_message(
                 }
             }
         } else {
-            final_reply = choice["message"]["content"]
+            let intermediate = choice["message"]["content"]
                 .as_str()
-                .unwrap_or("小妮处理中...")
+                .unwrap_or("")
                 .to_string();
+            if !intermediate.is_empty() {
+                query_history.push(format!("分析: {}", intermediate));
+            }
             break;
         }
     }
 
-    if final_reply.is_empty() {
-        final_reply = "小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？".to_string();
-    }
+    // 把查询过程合并到主对话，用于保存记忆
+    messages = query_messages;
+
+    // 4. 最终回复阶段（主模型）
+    let output_system = format!(
+        r#"你是企业数据助手"小妮"。你已经通过数据查询获取了结果，现在需要根据查询结果生成最终回复。
+
+用户原始问题：{}
+
+回复要求（非常重要）：
+1. 用大白话解释数据，不要讲数据库、表、字段、SQL
+2. 数据结果用 Markdown 表格呈现，表格上面加一句简单说明
+3. 主动告诉用户："这个问题在看板里也能看到可视化图表哦~"
+4. 可以建议生成哪些图表（如饼图、柱状图、折线图）来更直观展示数据
+5. 保持语气亲切、活泼，适当加 emoji
+6. 如果查无数据，请说："小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？""#,
+        content
+    );
+
+    let output_messages = vec![
+        json!({"role": "system", "content": output_system}),
+        json!({"role": "user", "content": format!("查询历史:\n\n{}\n\n请生成最终回复。", query_history.join("\n\n"))})
+    ];
+
+    let output_req = ToolCallRequest {
+        model: config.ai_model.clone(),
+        messages: output_messages,
+        tools: vec![],
+        temperature: 0.5,
+    };
+
+    let mut final_reply = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", config.ai_key))
+        .json(&output_req)
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(body) => body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("小妮处理中...")
+                .to_string(),
+            Err(_) => "小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？".to_string(),
+        },
+        Err(_) => "小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？".to_string(),
+    };
 
     // 轮数提醒
     round_count += 1;

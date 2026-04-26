@@ -13,6 +13,7 @@ interface AppConfig {
   ai_url: string;
   ai_key: string;
   ai_model: string;
+  query_model: string;
   ding_app_key: string;
   ding_app_secret: string;
 }
@@ -21,6 +22,7 @@ const defaultConfig: AppConfig = {
   ai_url: "",
   ai_key: "",
   ai_model: "deepseek-chat",
+  query_model: "",
   ding_app_key: "",
   ding_app_secret: "",
 };
@@ -256,6 +258,18 @@ export default function Settings() {
               onChange={(e) => updateField("ai_model", e.target.value)}
             />
           </div>
+          <div className="grid gap-2">
+            <Label htmlFor="query_model">查询模型（可选）</Label>
+            <Input
+              id="query_model"
+              placeholder="例如：deepseek-chat-lite，留空则使用主模型"
+              value={config.query_model}
+              onChange={(e) => updateField("query_model", e.target.value)}
+            />
+            <p className="text-xs text-slate-500">
+              用于数据库查询、看板匹配等场景，建议填写速度更快的模型
+            </p>
+          </div>
         </CardContent>
       </Card>
 
@@ -289,6 +303,9 @@ export default function Settings() {
               onChange={(e) => updateField("ding_app_secret", e.target.value)}
             />
           </div>
+          <p className="text-xs text-amber-600 bg-amber-50 p-2 rounded">
+            请确保钉钉应用已开启相关权限：单聊机器人使用管理权限、钉钉群基础信息管理权限、钉钉群基础信息读权限、群文件发送权限、个人手机号信息、企业员工手机号信息、通讯录个人信息读权限、成员信息读权限、企业内机器人发送消息权限
+          </p>
         </CardContent>
       </Card>
 

@@ -31,6 +31,12 @@ interface ColumnMapping {
   db_col: string;
 }
 
+interface SavedMappingConfig {
+  table_name: string;
+  mappings: ColumnMapping[];
+  auto_clean: boolean;
+}
+
 export default function PythonCodeModal({
   tableName,
   schema,
@@ -41,18 +47,36 @@ export default function PythonCodeModal({
   const [mappings, setMappings] = useState<ColumnMapping[]>([]);
   const [copied, setCopied] = useState(false);
   const [remarks, setRemarks] = useState<Record<string, string>>({});
+  const [hasSaved, setHasSaved] = useState(false);
 
   useEffect(() => {
     if (open) {
       loadDbPath();
       loadRemarks();
-      const autoMappings = schema.map((col) => ({
-        excel_col: col.name,
-        db_col: col.name,
-      }));
-      setMappings(autoMappings);
+      loadSavedMappings();
     }
-  }, [open, schema]);
+  }, [open, schema, tableName]);
+
+  async function loadSavedMappings() {
+    try {
+      const cfg = await invoke<SavedMappingConfig>("get_table_mappings", {
+        tableName,
+      });
+      if (cfg.mappings && cfg.mappings.length > 0) {
+        setMappings(cfg.mappings);
+        setHasSaved(true);
+        return;
+      }
+    } catch (e) {
+      console.error("加载已保存映射失败:", e);
+    }
+    const autoMappings = schema.map((col) => ({
+      excel_col: col.name,
+      db_col: col.name,
+    }));
+    setMappings(autoMappings);
+    setHasSaved(false);
+  }
 
   async function loadDbPath() {
     try {
@@ -119,6 +143,17 @@ for i in range(0, total, batch_size):
     conn.commit()
     print(f"已插入 {min(i+batch_size, total)} / {total} 行")
 
+# 通知去表格化助手刷新关联看板
+try:
+    cursor.execute(
+        'INSERT INTO _detabu_refresh_signals (table_name) VALUES (?)',
+        ("${tableName}",)
+    )
+    conn.commit()
+    print("📡 已通知看板刷新，5秒内看板将自动更新")
+except Exception as e:
+    print(f"⚠️ 刷新通知失败（可忽略）: {e}")
+
 cursor.close()
 conn.close()
 print("✅ 数据导入完成！")
@@ -169,10 +204,34 @@ print("✅ 数据导入完成！")
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="text-sm font-medium">字段映射（Excel列 → 数据库列）</label>
-              <Button variant="ghost" size="sm" onClick={addMapping}>
-                + 添加映射
-              </Button>
+              <div className="flex items-center gap-2">
+                {hasSaved && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs text-slate-500"
+                    onClick={() => {
+                      const auto = schema.map((col) => ({
+                        excel_col: col.name,
+                        db_col: col.name,
+                      }));
+                      setMappings(auto);
+                      setHasSaved(false);
+                    }}
+                  >
+                    重置为默认
+                  </Button>
+                )}
+                <Button variant="ghost" size="sm" onClick={addMapping}>
+                  + 添加映射
+                </Button>
+              </div>
             </div>
+            {hasSaved && (
+              <div className="text-xs text-emerald-700 bg-emerald-50 px-2 py-1 rounded">
+                已加载该表的"保存为默认映射配置"，生成代码会按这套映射重命名 Excel 列。
+              </div>
+            )}
             {mappings.map((mapping, index) => (
               <div key={index} className="flex items-center gap-2">
                 <input

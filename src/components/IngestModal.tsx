@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
+import { invalidateBySourceTable } from "@/lib/dashboardHtmlCache";
 
 interface ProgressPayload {
   percent: number;
@@ -62,6 +63,7 @@ export default function IngestModal({
 
     invoke("ingest_full_data", { filePath, cleanSql, tableName })
       .then(() => {
+        invalidateBySourceTable(tableName);
         toast.success("全量入库完成");
         if (errorRows > 0) {
           toast.info(`入库成功，但跳过了 ${errorRows} 行异常数据`);

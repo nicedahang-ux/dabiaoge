@@ -155,9 +155,15 @@ export default function MessageBubble({
             </p>
 
             {questions!.map((q, idx) => {
-              // 去重选项 key，防止 AI 重复输出同 key
+              // 去重选项 key，防止 AI 重复输出同 key；
+              // 同时过滤掉 AI 自己写的"其它"/"其他"选项，因为下方有专用的"其它"单选框 + 文本框。
               const uniqueOptions = q.options
-                ? Array.from(new Map(q.options.map((o) => [o.key, o])).values())
+                ? Array.from(new Map(q.options.map((o) => [o.key, o])).values()).filter(
+                    (o) => {
+                      const t = (o.text || "").trim();
+                      return t !== "其它" && t !== "其他";
+                    }
+                  )
                 : [];
               return (
               <div key={`${idx}-${q.number}`} className="space-y-1">

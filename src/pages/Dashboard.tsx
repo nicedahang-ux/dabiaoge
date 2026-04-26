@@ -49,6 +49,12 @@ import CreateDashboardModal from "@/components/CreateDashboardModal";
 import { useApp, type Dashboard } from "@/lib/AppContext";
 import { formatBeijingTime } from "@/lib/utils";
 import { estimateTokens } from "@/lib/thoughtGuideQuestions";
+import {
+  getCached as getCachedHtml,
+  setCached as setCachedHtml,
+  subscribe as subscribeHtmlCache,
+  invalidateBySourceTable,
+} from "@/lib/dashboardHtmlCache";
 
 interface ChartData {
   name: string;
@@ -117,9 +123,13 @@ export default function DashboardPage() {
   const [deleteMode, setDeleteMode] = useState<"dashboard" | "with_table">("dashboard");
   const [htmlSrcDoc, setHtmlSrcDoc] = useState<string | null>(null);
   const [htmlLoading, setHtmlLoading] = useState(false);
-  const htmlCacheRef = useRef<Map<string, string>>(new Map());
+  const [cacheVersion, setCacheVersion] = useState(0);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const dashboardDetailRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    return subscribeHtmlCache(() => setCacheVersion((v) => v + 1));
+  }, []);
 
   // 动态调整 iframe 高度，消除滚动条
   const adjustIframeHeight = useCallback(() => {
@@ -134,16 +144,24 @@ export default function DashboardPage() {
     ? dashboards.find((d) => d.id === boardsSelectedId) || null
     : null;
 
-  // HTML 看板数据注入：后端直接渲染带数据的 HTML，减少 IPC 和数据处理开销
+  // HTML 看板数据注入：模块级缓存跨页面切换持久；源表数据更新会触发 invalidate 后自动重渲
   useEffect(() => {
+    let cancelled = false;
     async function injectHtmlData() {
-      if (!selectedDashboard?.html_content || !selectedDashboard?.source_table) {
-        setHtmlSrcDoc(selectedDashboard?.html_content || null);
+      if (!selectedDashboard?.html_content) {
+        setHtmlSrcDoc(null);
         return;
       }
       const cacheKey = selectedDashboard.id;
-      if (htmlCacheRef.current.has(cacheKey)) {
-        setHtmlSrcDoc(htmlCacheRef.current.get(cacheKey)!);
+      const cached = getCachedHtml(cacheKey);
+      if (cached) {
+        setHtmlSrcDoc(cached);
+        return;
+      }
+      // 没有 source_table 的看板用静态 html_content 即可，无需拼接数据
+      if (!selectedDashboard.source_table) {
+        setHtmlSrcDoc(selectedDashboard.html_content);
+        setCachedHtml(cacheKey, selectedDashboard.html_content, null);
         return;
       }
       setHtmlLoading(true);
@@ -151,23 +169,33 @@ export default function DashboardPage() {
         const html = await invoke<string>("render_html_dashboard", {
           dashboardId: selectedDashboard.id,
         });
-        htmlCacheRef.current.set(cacheKey, html);
+        if (cancelled) return;
+        setCachedHtml(cacheKey, html, selectedDashboard.source_table || null);
         setHtmlSrcDoc(html);
       } catch (e) {
+        if (cancelled) return;
         console.error("HTML 渲染失败:", e);
         let html = selectedDashboard.html_content;
         const hideCss = `<style>
           .container > .card:first-of-type { display: none !important; }
         </style>`;
         html = html.replace('</head>', hideCss + '</head>');
-        htmlCacheRef.current.set(cacheKey, html);
+        setCachedHtml(cacheKey, html, selectedDashboard.source_table || null);
         setHtmlSrcDoc(html);
       } finally {
-        setHtmlLoading(false);
+        if (!cancelled) setHtmlLoading(false);
       }
     }
     injectHtmlData();
-  }, [selectedDashboard?.id, selectedDashboard?.html_content, selectedDashboard?.source_table]);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedDashboard?.id,
+    selectedDashboard?.html_content,
+    selectedDashboard?.source_table,
+    cacheVersion,
+  ]);
 
   useEffect(() => {
     refreshDashboards();
@@ -535,7 +563,7 @@ export default function DashboardPage() {
   return (
     <div className="flex flex-col h-full overflow-auto"
     >
-      <div className="p-6 space-y-6 max-w-7xl mx-auto w-full"
+      <div className="p-6 space-y-6 w-full"
       >
         <div className="flex items-center justify-between"
         >
@@ -692,25 +720,33 @@ export default function DashboardPage() {
                   <CardTitle className="text-sm">HTML 内容</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  {htmlLoading && (
-                    <div className="flex items-center justify-center gap-2 text-sm text-slate-500 py-8">
-                      <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
-                      正在加载 HTML 数据...
-                    </div>
-                  )}
-                  <iframe
-                    ref={iframeRef}
-                    srcDoc={htmlSrcDoc ?? selectedDashboard.html_content}
-                    style={{ width: "100%", border: "none", display: htmlLoading ? "none" : "block" }}
-                    sandbox="allow-scripts allow-same-origin"
-                    title="看板 HTML 内容"
-                    onLoad={() => {
-                      adjustIframeHeight();
-                      // echarts 等异步内容渲染后再调整一次
-                      setTimeout(adjustIframeHeight, 500);
-                      setTimeout(adjustIframeHeight, 1500);
-                    }}
-                  />
+                  <div className="relative" style={{ minHeight: htmlLoading ? 600 : undefined }}>
+                    {htmlLoading && (
+                      <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-white/85 backdrop-blur-[2px] rounded-md">
+                        <Loader2 className="h-10 w-10 animate-spin text-blue-500" />
+                        <p className="text-base font-medium text-slate-700">看板正在加载中，请稍候…</p>
+                        <p className="text-xs text-slate-500">首次加载会执行 SQL 拼装数据，约需 2–10 秒</p>
+                      </div>
+                    )}
+                    <iframe
+                      ref={iframeRef}
+                      srcDoc={htmlSrcDoc ?? selectedDashboard.html_content}
+                      style={{
+                        width: "100%",
+                        border: "none",
+                        opacity: htmlLoading ? 0.2 : 1,
+                        transition: "opacity 200ms",
+                      }}
+                      sandbox="allow-scripts allow-same-origin"
+                      title="看板 HTML 内容"
+                      onLoad={() => {
+                        adjustIframeHeight();
+                        // echarts 等异步内容渲染后再调整一次
+                        setTimeout(adjustIframeHeight, 500);
+                        setTimeout(adjustIframeHeight, 1500);
+                      }}
+                    />
+                  </div>
                 </CardContent>
               </Card>
             )}
@@ -991,6 +1027,7 @@ export default function DashboardPage() {
                     await invoke("drop_user_table", {
                       tableName: deletingDashboard.source_table,
                     });
+                    invalidateBySourceTable(deletingDashboard.source_table);
                   }
                   toast.success("看板已删除");
                   setDeletingDashboard(null);

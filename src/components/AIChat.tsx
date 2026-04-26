@@ -6,10 +6,11 @@ import { Loader2, Bot, Clock, CheckCircle2, Circle, Zap, FileSpreadsheet, X, Dat
 import InputArea, { type Attachment } from "@/components/InputArea";
 import MessageBubble from "@/components/MessageBubble";
 import ExecutionTracker from "@/components/ExecutionTracker";
+import AiHtmlBuildOverlay from "@/components/AiHtmlBuildOverlay";
 import { useApp, type ChatMessage, type Dashboard } from "@/lib/AppContext";
 import { estimateTokens } from "@/lib/thoughtGuideQuestions";
 import { formatBeijingTime } from "@/lib/utils";
-import IngestModal from "@/components/IngestModal";
+import { invalidateBySourceTable, invalidateOne } from "@/lib/dashboardHtmlCache";
 import DbTableSelectModal, { type DbTablePreview } from "@/components/DbTableSelectModal";
 
 interface StepStatus {
@@ -31,9 +32,11 @@ interface ChatTablePreview {
   preview_data: string[][];
 }
 
-interface IngestSuggestion {
-  table_name: string;
-  clean_sql: string;
+interface CreateDashboardResult {
+  dashboard_id: string;
+  dashboard_name: string;
+  created_tables: string[];
+  warnings: string[];
 }
 
 interface ModifyingState {
@@ -65,10 +68,9 @@ export default function AIChat({
   const [filePreview, setFilePreview] = useState<TablePreviewPayload | null>(null);
   const [filePath, setFilePath] = useState("");
   const [parsingFile, setParsingFile] = useState(false);
-  const [suggestion, setSuggestion] = useState<IngestSuggestion | null>(null);
-  const [ingestOpen, setIngestOpen] = useState(false);
   const [_modifyTrackerActive, _setModifyTrackerActive] = useState(false);
   const [modifyingState, setModifyingState] = useState<ModifyingState>({ status: "idle" });
+  const [htmlBuildActive, setHtmlBuildActive] = useState(false);
   const [steps, setSteps] = useState<StepStatus[]>([]);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -78,42 +80,54 @@ export default function AIChat({
   const [nodePositions, setNodePositions] = useState<{ id: string; top: number; preview: string }[]>([]);
   const [dbSelectOpen, setDbSelectOpen] = useState(false);
   const [dbTablePreviews, setDbTablePreviews] = useState<DbTablePreview[]>([]);
-  const [retryStatus, setRetryStatus] = useState<{ active: boolean; attempt: number; total: number }>({
-    active: false,
-    attempt: 0,
-    total: 3,
-  });
 
   const currentSession = sessions.find((s) => s.id === sessionId);
   const [dashboardContext, setDashboardContext] = useState<string | null>(null);
 
   useEffect(() => {
-    if (dashboardTag) {
-      invoke<Dashboard>("get_dashboard", { id: dashboardTag })
-        .then((d) => {
-          let ctx = `当前正在修改的看板信息：\n- 名称：${d.name}\n- 描述：${d.description || "无"}\n- SQL模板：${d.sql_template || "无"}\n- 筛选器配置：${d.ui_filters || "[]"}\n- 图表配置：${d.charts || "[]"}\n`;
-          if (d.summary_cards) {
-            try { ctx += `- 摘要卡片：${d.summary_cards}\n`; } catch {}
-          }
-          if (d.actions) {
-            try { ctx += `- 操作按钮：${d.actions}\n`; } catch {}
-          }
-          if (d.table_data) {
-            try {
-              const rows = JSON.parse(d.table_data) as Record<string, unknown>[];
-              if (rows.length > 0) {
-                const preview = rows.slice(0, 10);
-                ctx += `- 明细数据前 ${preview.length} 行：\n${JSON.stringify(preview, null, 2)}\n`;
-              }
-            } catch {}
-          }
-          ctx += `请基于以上看板信息进行修改和优化。`;
-          setDashboardContext(ctx);
-        })
-        .catch(() => setDashboardContext(null));
-    } else {
+    if (!dashboardTag) {
       setDashboardContext(null);
+      return;
     }
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await invoke<Dashboard>("get_dashboard", { id: dashboardTag });
+        let ctx = `当前正在修改的看板信息：\n- 名称：${d.name}\n- 描述：${d.description || "无"}\n`;
+        if (d.source_table) {
+          ctx += `- 源数据表：${d.source_table}\n`;
+        }
+        if (d.html_content) {
+          ctx += `\n【当前看板完整 HTML 源码（修改时务必输出新的完整 HTML，保留 window.rawExcelData / runAnalysisLogic / 中文列名 key）】\n${d.html_content}\n`;
+        }
+        if (d.source_table) {
+          try {
+            const sql = `SELECT * FROM "${d.source_table}" LIMIT 20`;
+            const sqlRes = await invoke<{ columns: string[]; rows: string[][] }>(
+              "run_sql_query_for_chat",
+              { sql }
+            );
+            const previewRows = sqlRes.rows.map((row) => {
+              const obj: Record<string, string> = {};
+              sqlRes.columns.forEach((c, i) => {
+                obj[c] = row[i] ?? "";
+              });
+              return obj;
+            });
+            ctx += `\n【源表 ${d.source_table} 前 ${previewRows.length} 行预览】\n${JSON.stringify(previewRows, null, 2)}\n`;
+          } catch {
+            // 静默忽略：无源表预览不影响修改
+          }
+        }
+        ctx += `\n请基于以上看板信息进行修改，并在回复最末尾输出完整新 HTML 代码块。`;
+        if (!cancelled) setDashboardContext(ctx);
+      } catch {
+        if (!cancelled) setDashboardContext(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [dashboardTag]);
 
   useEffect(() => {
@@ -253,122 +267,29 @@ export default function AIChat({
     return content.trim();
   }, []);
 
-  // 去除 markdown 代码块
-  const stripMarkdownCodeBlocks = useCallback((content: string): string => {
-    return content.replace(/```(?:json)?\s*([\s\S]*?)```/g, "$1").trim();
-  }, []);
-
-  // 从 AI 回复中提取 action JSON
-  const extractActionJson = useCallback((content: string): { action: string; dashboard?: any; table_name?: string; clean_sql?: string; sql?: string } | null => {
-    const cleaned = stripMarkdownCodeBlocks(content);
-    // 策略1：精确匹配 action 字段
-    const patterns = [
-      /\{\s*"action"\s*:\s*"create_dashboard"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
-      /\{\s*"action"\s*:\s*"update_dashboard"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
-      /\{\s*"action"\s*:\s*"ingest"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
-      /\{\s*"action"\s*:\s*"run_sql"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
-    ];
-    for (const pattern of patterns) {
-      const match = cleaned.match(pattern);
-      if (match) {
-        try {
-          const parsed = JSON.parse(match[0]);
-          if (parsed.action) return parsed;
-        } catch {
-          // 策略2：尝试用更宽松的贪婪匹配
-          const looseMatch = cleaned.match(/\{[\s\S]*"action"\s*:\s*"[^"]+"[\s\S]*\}/);
-          if (looseMatch) {
-            try {
-              const parsed = JSON.parse(looseMatch[0]);
-              if (parsed.action) return parsed;
-            } catch {
-              // ignore
-            }
-          }
-        }
-      }
-    }
-    // 策略3：直接搜索最后出现的 { ... }
-    const allJsonLike = cleaned.match(/\{[\s\S]*?\}/g);
-    if (allJsonLike) {
-      for (let i = allJsonLike.length - 1; i >= 0; i--) {
-        try {
-          const parsed = JSON.parse(allJsonLike[i]);
-          if (parsed.action) return parsed;
-        } catch {
-          // ignore
-        }
+  // 从 AI 回复中提取 ```html ...``` 代码块；找不到返回 null
+  const extractHtmlBlock = useCallback((content: string): string | null => {
+    const re = /```html\s*\n([\s\S]*?)```/i;
+    const match = content.match(re);
+    if (match && match[1]) {
+      const html = match[1].trim();
+      if (html.toLowerCase().includes("<!doctype html") || html.toLowerCase().includes("<html")) {
+        return html;
       }
     }
     return null;
-  }, [stripMarkdownCodeBlocks]);
-
-  // 规范化 AI 返回的 action JSON，处理常见字段名不匹配问题
-  const normalizeActionJson = useCallback((raw: any): any => {
-    if (!raw || !raw.action) return raw;
-    const normalized = { ...raw };
-
-    // 处理 create_dashboard / update_dashboard
-    if (["create_dashboard", "update_dashboard"].includes(raw.action)) {
-      let dashboard = raw.dashboard;
-
-      // AI 经常漏掉 dashboard 包装层，把字段直接放在顶层
-      if (!dashboard && (raw.name || raw.title || raw.sql_template || raw.filters || raw.charts)) {
-        const { action: _, ...rest } = raw;
-        dashboard = rest;
-        normalized.dashboard = dashboard;
-      }
-
-      if (dashboard && typeof dashboard === "object") {
-        // 字段名映射：AI 常犯的错误
-        if (dashboard.title && !dashboard.name) dashboard.name = dashboard.title;
-        if (dashboard.sheet_name && !dashboard.source_table) dashboard.source_table = dashboard.sheet_name;
-        if (dashboard.filters && !dashboard.ui_filters) dashboard.ui_filters = dashboard.filters;
-
-        // charts 可能是对象数组（AI 常犯错误），需要提取 type 字段转成字符串数组
-        if (Array.isArray(dashboard.charts)) {
-          const chartArray = dashboard.charts;
-          if (chartArray.length > 0 && typeof chartArray[0] === "object" && chartArray[0].type) {
-            dashboard.charts = chartArray
-              .map((c: any) => c.type)
-              .filter((t: string) => ["pie", "bar", "line", "table"].includes(t));
-          }
-        }
-
-        // 确保 sql_template 至少有值（AI 有时会漏掉）
-        if (!dashboard.sql_template) {
-          dashboard.sql_template = `SELECT * FROM ${dashboard.source_table || "temp_table"}`;
-        }
-      }
-    }
-
-    return normalized;
   }, []);
 
-  // 自动更新看板 — 只传 AI 明确给出的字段，防止清空现有数据
-  // 特别注意：table_data 由系统从数据库自动查询填充，绝不从前端/AI 更新覆盖
-  const autoUpdateDashboard = useCallback(async (dashboardConfig: any) => {
-    if (!dashboardTag) return;
-    setModifyingState({ status: "updating" });
-    try {
-      const payload: Record<string, any> = { id: dashboardTag };
-      if ("name" in dashboardConfig) payload.name = dashboardConfig.name;
-      if ("description" in dashboardConfig) payload.description = dashboardConfig.description || "";
-      if ("sql_template" in dashboardConfig) payload.sqlTemplate = dashboardConfig.sql_template || "";
-      if ("ui_filters" in dashboardConfig) payload.uiFilters = JSON.stringify(dashboardConfig.ui_filters || []);
-      if ("charts" in dashboardConfig) payload.charts = JSON.stringify(dashboardConfig.charts || []);
-      if ("actions" in dashboardConfig) payload.actions = JSON.stringify(dashboardConfig.actions || []);
-      if ("summary_cards" in dashboardConfig) payload.summaryCards = JSON.stringify(dashboardConfig.summary_cards || []);
-      // 严禁传递 table_data，防止 AI 误清空看板数据
-      // if ("table_data" in dashboardConfig) payload.tableData = ...
-      if ("source_table" in dashboardConfig) payload.sourceTable = dashboardConfig.source_table || "";
-      await invoke("update_dashboard", payload);
-      setModifyingState({ status: "success", dashboardId: dashboardTag });
-      refreshDashboards();
-    } catch (e) {
-      setModifyingState({ status: "error", error: String(e) });
-    }
-  }, [dashboardTag, refreshDashboards]);
+  // 把 AI 回复里的 ```html ...``` 代码块替换为轻提示，保留前置解释文字
+  const stripHtmlBlockForBubble = useCallback((content: string, mode: "create" | "modify"): string => {
+    const replacement =
+      mode === "modify"
+        ? "✅ 已生成完整看板新 HTML，正在为你替换看板源码…"
+        : "✅ 已生成完整看板 HTML，正在为你创建数据表与看板…";
+    const re = /```html\s*\n[\s\S]*?```/i;
+    const replaced = content.replace(re, replacement).trim();
+    return replaced || replacement;
+  }, []);
 
   const persistSession = useCallback(
     async (newMessages: ChatMessage[], newTokenCount: number, newTitle?: string) => {
@@ -519,107 +440,14 @@ export default function AIChat({
         history = [{ role: "system", content: dashboardContext }, ...history];
       }
 
-      const callChat = async (hist: typeof history): Promise<string> => {
-        return await invoke<string>("chat_workbench", {
-          messages: hist,
-          tablePreview: effectivePreview,
-          dbTablePreviews: dbTablePreviews.length > 0 ? dbTablePreviews : null,
-          chatAttachmentPreviews: allTablePreviews.length > 0 ? allTablePreviews : null,
-          thoughtGuideMode,
-          modifyingDashboard: !!dashboardTag,
-        });
-      };
-
-      // 抽出的局部函数：执行一次 AI 调用（含 run_sql 二轮）
-      const tryGetDashboard = async (
-        hist: typeof history,
-        currentMessages: ChatMessage[],
-        currentTokenCount: number
-      ): Promise<{ res: string; nextMessages: ChatMessage[]; nextTokenCount: number }> => {
-        let res = await callChat(hist);
-        const firstAction = normalizeActionJson(extractActionJson(res));
-        if (firstAction?.action === "run_sql" && firstAction.sql) {
-          try {
-            const sqlRes = await invoke<{ columns: string[]; rows: string[][] }>("run_sql_query_for_chat", {
-              sql: firstAction.sql,
-            });
-            const sqlResultText = `SQL 查询结果：\n列: ${JSON.stringify(sqlRes.columns)}\n数据: ${JSON.stringify(sqlRes.rows.slice(0, 20))}`;
-            const firstAssistantMsg: ChatMessage = {
-              id: `assistant-${Date.now()}`,
-              role: "assistant",
-              content: sanitizeAssistantContent(res.replace(JSON.stringify(firstAction), "").trim()) || res.replace(JSON.stringify(firstAction), "").trim(),
-              timestamp: formatBeijingTime(new Date()),
-              durationMs: Date.now() - reqStartTime,
-            };
-            const midMessages = [...currentMessages, firstAssistantMsg];
-            setMessages(midMessages);
-            const midTokenCount = currentTokenCount + estimateTokens(res);
-            setTokenCount(midTokenCount);
-            await persistSession(midMessages, midTokenCount);
-
-            let secondHistory: { role: string; content: string }[] = midMessages.map((m) => ({ role: m.role, content: m.content }));
-            secondHistory.push({ role: "system", content: sqlResultText });
-            if (dashboardContext) {
-              secondHistory = [{ role: "system", content: dashboardContext }, ...secondHistory];
-            }
-            res = await callChat(secondHistory);
-            return { res, nextMessages: midMessages, nextTokenCount: midTokenCount };
-          } catch (sqlErr) {
-            toast.error("AI 自动查库失败: " + String(sqlErr));
-          }
-        }
-        return { res, nextMessages: currentMessages, nextTokenCount: currentTokenCount };
-      };
-
-      // 初始调用
-      let currentMessages = newMessages;
-      let currentTokenCount = newTokenCount;
-      let { res, nextMessages, nextTokenCount } = await tryGetDashboard(history, currentMessages, currentTokenCount);
-      currentMessages = nextMessages;
-      currentTokenCount = nextTokenCount;
-
-      // 兜底重试循环
-      const TARGET_ACTIONS = ["create_dashboard", "update_dashboard"];
-      const isDashboardAction = (a: any) => a && TARGET_ACTIONS.includes(a.action);
-      let retries = 0;
-      const MAX_RETRY = 3;
-      const userAnswerRounds = currentMessages.filter((m) => m.role === "user").length;
-
-      while (!isDashboardAction(normalizeActionJson(extractActionJson(res)))) {
-        const extractedNow = normalizeActionJson(extractActionJson(res));
-        // AI 还在合理提问 → break
-        if (res.includes("【关键提问】") && userAnswerRounds < 5) break;
-        // 合法 ingest 动作 → break
-        if (extractedNow && extractedNow.action === "ingest") break;
-
-        retries++;
-        if (retries > MAX_RETRY) {
-          toast.error(`AI 在 ${MAX_RETRY} 次重试后仍未生成看板，请检查信息是否充分`);
-          break;
-        }
-
-        setRetryStatus({ active: true, attempt: retries, total: MAX_RETRY });
-
-        // 移除上一轮 escalation，避免堆叠
-        if (retries > 1 && (history[history.length - 1] as any)?._isEscalation) {
-          history.pop();
-        }
-
-        const escalation =
-          retries === 1
-            ? "请基于以上对话内容，直接输出可执行的 create_dashboard JSON。禁止再使用 run_sql，禁止再提问，信息不足时合理推测填充。JSON 必须严格符合系统提示中的格式要求。特别注意：必须有 dashboard 包装层，字段名必须是 name/sql_template/ui_filters/charts/source_table，严禁使用 title/filters/sheet_name 等字段名。"
-            : retries === 2
-            ? '【系统强制】你必须立即输出纯文本 JSON，格式如下（严禁 markdown 代码块，禁止任何其它文字）：\n{"action":"create_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT * FROM 表名","ui_filters":[],"charts":["pie","bar"],"source_table":"表名"}}\n注意：dashboard 对象内字段名必须是 name/sql_template/ui_filters/charts/source_table，charts 必须是字符串数组（如 ["pie","bar"]），严禁使用 title/filters/sheet_name/calculated_fields。'
-            : '【最后一次机会】严格输出以下格式，任何偏差都将导致失败：\n{"action":"create_dashboard","dashboard":{"name":"...","description":"...","sql_template":"...","ui_filters":[],"charts":["pie","bar","line","table"],"actions":[],"summary_cards":[],"source_table":"..."}}';
-
-        const escMsg: any = { role: "user", content: escalation, _isEscalation: true };
-        history.push(escMsg);
-        ({ res, nextMessages, nextTokenCount } = await tryGetDashboard(history, currentMessages, currentTokenCount));
-        currentMessages = nextMessages;
-        currentTokenCount = nextTokenCount;
-      }
-
-      setRetryStatus({ active: false, attempt: 0, total: MAX_RETRY });
+      const res = await invoke<string>("chat_workbench", {
+        messages: history,
+        tablePreview: effectivePreview,
+        dbTablePreviews: dbTablePreviews.length > 0 ? dbTablePreviews : null,
+        chatAttachmentPreviews: allTablePreviews.length > 0 ? allTablePreviews : null,
+        thoughtGuideMode,
+        modifyingDashboard: !!dashboardTag,
+      });
 
       setSteps((prev) =>
         prev.map((s) =>
@@ -631,71 +459,78 @@ export default function AIChat({
         )
       );
 
-      let displayContent = res;
-      let parsedDashboard: any = null;
+      const html = extractHtmlBlock(res);
+      let displayContent: string;
 
-      const extractedAction = normalizeActionJson(extractActionJson(res));
+      if (html) {
+        const mode: "create" | "modify" = dashboardTag ? "modify" : "create";
+        displayContent = stripHtmlBlockForBubble(res, mode);
+        setHtmlBuildActive(true);
+        setModifyingState({ status: "updating" });
 
-      if (extractedAction) {
-        const jsonRaw = JSON.stringify(extractedAction);
-        displayContent = sanitizeAssistantContent(res.replace(jsonRaw, "").trim()) || res.replace(jsonRaw, "").trim();
-
-        if (extractedAction.action === "create_dashboard" && extractedAction.dashboard) {
-          parsedDashboard = extractedAction.dashboard;
-          setModifyingState({ status: "updating" });
-          try {
-            const newId = await invoke<string>("create_dashboard", {
-              name: parsedDashboard.name,
-              description: parsedDashboard.description || "",
-              sqlTemplate: parsedDashboard.sql_template || "",
-              uiFilters: JSON.stringify(parsedDashboard.ui_filters || []),
-              charts: JSON.stringify(parsedDashboard.charts || []),
-              tableData: JSON.stringify(parsedDashboard.table_data || []),
-              sourceTable: parsedDashboard.source_table || "",
-              actions: JSON.stringify(parsedDashboard.actions || []),
-              summaryCards: JSON.stringify(parsedDashboard.summary_cards || []),
+        try {
+          if (mode === "modify" && dashboardTag) {
+            await invoke("update_dashboard", {
+              id: dashboardTag,
+              htmlContent: html,
             });
-            setModifyingState({ status: "success", dashboardId: newId });
-            refreshDashboards();
-          } catch (e) {
-            setModifyingState({ status: "error", error: String(e) });
-          }
-        }
-
-        if (extractedAction.action === "update_dashboard" && extractedAction.dashboard) {
-          parsedDashboard = extractedAction.dashboard;
-          if (dashboardTag) {
-            await autoUpdateDashboard(parsedDashboard);
-          } else {
-            setModifyingState({ status: "updating" });
+            invalidateOne(dashboardTag);
             try {
-              const newId = await invoke<string>("create_dashboard", {
-                name: parsedDashboard.name,
-                description: parsedDashboard.description || "",
-                sqlTemplate: parsedDashboard.sql_template || "",
-                uiFilters: JSON.stringify(parsedDashboard.ui_filters || []),
-                charts: JSON.stringify(parsedDashboard.charts || []),
-                tableData: JSON.stringify(parsedDashboard.table_data || []),
-                sourceTable: parsedDashboard.source_table || "",
-              });
-              setModifyingState({ status: "success", dashboardId: newId });
-              refreshDashboards();
-            } catch (e) {
-              setModifyingState({ status: "error", error: String(e) });
+              const d = await invoke<Dashboard>("get_dashboard", { id: dashboardTag });
+              if (d.source_table) invalidateBySourceTable(d.source_table);
+            } catch {
+              // 静默忽略
             }
-          }
-        }
+            setModifyingState({ status: "success", dashboardId: dashboardTag });
+            refreshDashboards();
+          } else {
+            // 创建模式：把当前预览的单文件 + 聊天附件表格 → NewFileSpec[]
+            const newFiles: { file_path: string; target_table_name: string }[] = [];
+            const seen = new Set<string>();
+            const toTargetName = (p: string, idx: number): string => {
+              const fname = p.split(/[\\/]/).pop() || `file_${idx}`;
+              const baseName = fname.replace(/\.(xlsx|xls|csv)$/i, "");
+              return baseName.toLowerCase().replace(/[^a-z0-9_]/g, "_") || `t_data_${idx}`;
+            };
+            if (filePath) {
+              newFiles.push({ file_path: filePath, target_table_name: toTargetName(filePath, 0) });
+              seen.add(filePath);
+            }
+            tableAttachments.forEach((ta, idx) => {
+              if (!ta.path || seen.has(ta.path)) return;
+              newFiles.push({ file_path: ta.path, target_table_name: toTargetName(ta.path, idx + 1) });
+              seen.add(ta.path);
+            });
+            const existingTables = dbTablePreviews.map((p) => p.table_name);
 
-        if (extractedAction.action === "ingest") {
-          setSuggestion({
-            table_name: extractedAction.table_name || "t_data",
-            clean_sql: extractedAction.clean_sql || "",
-          });
+            if (newFiles.length === 0 && existingTables.length === 0) {
+              throw new Error("缺少数据来源：请在工作台先选择数据库表或上传表格");
+            }
+
+            const result = await invoke<CreateDashboardResult>("create_dashboard_from_ai_html", {
+              htmlContent: html,
+              newFiles,
+              existingTables,
+              dashboardName: null,
+            });
+            result.created_tables.forEach((t) => invalidateBySourceTable(t));
+            existingTables.forEach((t) => invalidateBySourceTable(t));
+            setModifyingState({ status: "success", dashboardId: result.dashboard_id });
+            refreshDashboards();
+          }
+        } catch (e) {
+          setModifyingState({ status: "error", error: String(e) });
+          toast.error(String(e));
+        } finally {
+          setHtmlBuildActive(false);
         }
-      } else if (dashboardTag) {
-        // 处于修改模式但未提取到 JSON，给出提示
-        displayContent = res + "\n\n【系统提示】未检测到可执行的操作指令，请尝试更明确地描述修改需求（例如：把饼图改成显示百分比）";
+      } else {
+        // 没有 HTML 代码块 → 普通对话（追问 / 闲聊）
+        displayContent = sanitizeAssistantContent(res) || res;
       }
+
+      const currentMessages = newMessages;
+      const currentTokenCount = newTokenCount;
 
       const assistantMsg: ChatMessage = {
         id: `assistant-${Date.now()}`,
@@ -726,7 +561,6 @@ export default function AIChat({
     } finally {
       setLoading(false);
       setStartTime(null);
-      setRetryStatus({ active: false, attempt: 0, total: 3 });
     }
   };
 
@@ -929,24 +763,18 @@ export default function AIChat({
         )}
       </div>
 
-      {/* Retry Status */}
-      {retryStatus.active && (
-        <div className="px-4 pb-2 max-w-4xl mx-auto w-full">
-          <div className="border border-orange-200 bg-orange-50 rounded-lg p-4 flex items-center gap-3">
-            <Loader2 className="h-4 w-4 animate-spin text-orange-600" />
-            <span className="text-sm font-medium text-orange-800">
-              AI 沉默中，正在第 {retryStatus.attempt}/{retryStatus.total} 次强制重试...
-            </span>
-          </div>
-        </div>
-      )}
+      {/* HTML 看板生成进度 */}
+      <AiHtmlBuildOverlay
+        isActive={htmlBuildActive}
+        mode={dashboardTag ? "modify" : "create"}
+      />
 
       {/* Dashboard Action Area */}
-      {modifyingState.status === "updating" && (
+      {modifyingState.status === "updating" && !htmlBuildActive && (
         <div className="px-4 pb-2 max-w-4xl mx-auto w-full">
           <div className="border border-amber-200 bg-amber-50 rounded-lg p-4 flex items-center gap-3">
             <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
-            <span className="text-sm font-medium text-amber-800">正在为您修改看板，请稍候...</span>
+            <span className="text-sm font-medium text-amber-800">正在为您处理看板，请稍候...</span>
           </div>
         </div>
       )}
@@ -982,14 +810,6 @@ export default function AIChat({
         tokenCount={tokenCount}
         dashboardTag={dashboardTag}
         onClearDashboardTag={onClearDashboardTag}
-      />
-
-      <IngestModal
-        filePath={filePath}
-        cleanSql={suggestion?.clean_sql || ""}
-        tableName={suggestion?.table_name || "t_data"}
-        open={ingestOpen}
-        onOpenChange={setIngestOpen}
       />
 
       <DbTableSelectModal

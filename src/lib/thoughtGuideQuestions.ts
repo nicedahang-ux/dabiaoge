@@ -23,7 +23,9 @@ function normalizeKey(raw: string): string {
 }
 
 function extractInlineOptions(text: string): { cleanText: string; options: ThoughtOption[] } {
-  const inlineRegex = /([A-Za-z]|[①-⑩])\s*[.．、)）]\s*([^A-Za-z①-⑩\n]+?)(?=\s+([A-Za-z]|[①-⑩])\s*[.．、)）]|$)/g;
+  // 选项文本可以包含字母（如 `item_no`、SKU 等），所以用 .+? 配合 lookahead 切分，
+  // 不能再用负字符类 [^A-Za-z..] —— 那样会在第一个字母处断开。
+  const inlineRegex = /([A-Za-z]|[①-⑩])\s*[.．、)）]\s*(.+?)(?=\s+([A-Za-z]|[①-⑩])\s*[.．、)）]|$)/g;
   const opts: ThoughtOption[] = [];
   const matches: { full: string; key: string; text: string }[] = [];
   let m: RegExpExecArray | null;
@@ -74,6 +76,16 @@ export function parseThoughtQuestions(content: string): ThoughtQuestion[] | null
         i++;
         while (i < lines.length) {
           const optLine = lines[i].trim();
+          // 选项行本身可能也是 "A. xx B. yy C. zz" 这种内联多选项形式，
+          // 优先按内联拆分，避免被 OPTION_LINE 整行贪婪吃成单选项。
+          const inlineOnLine = extractInlineOptions(optLine);
+          if (inlineOnLine.options.length >= 2) {
+            for (const o of inlineOnLine.options) {
+              if (!options.some((x) => x.key === o.key)) options.push(o);
+            }
+            i++;
+            continue;
+          }
           const optMatch = optLine.match(OPTION_LINE);
           if (optMatch) {
             const key = normalizeKey(optMatch[1]);

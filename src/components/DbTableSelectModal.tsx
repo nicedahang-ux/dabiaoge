@@ -16,6 +16,7 @@ export interface DbTablePreview {
   remark: string;
   columns: string[];
   preview_data: string[][];
+  column_remarks: Record<string, string>;
 }
 
 interface Props {
@@ -61,16 +62,20 @@ export default function DbTableSelectModal({ open, onClose, onConfirm }: Props) 
     try {
       const previews: DbTablePreview[] = [];
       for (const tableName of selected) {
-        const res = await invoke<{ columns: string[]; rows: string[][] }>("query_table_data", {
-          tableName,
-          limit: 20,
-        });
+        const [res, columnRemarks] = await Promise.all([
+          invoke<{ columns: string[]; rows: string[][] }>("query_table_data", {
+            tableName,
+            limit: 20,
+          }),
+          invoke<Record<string, string>>("get_column_remarks", { tableName }).catch(() => ({})),
+        ]);
         const info = tables.find((t) => t.table_name === tableName);
         previews.push({
           table_name: tableName,
           remark: info?.remark || "",
           columns: res.columns,
           preview_data: res.rows,
+          column_remarks: columnRemarks || {},
         });
       }
       onConfirm(previews);

@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub ai_url: String,
     pub ai_key: String,
     pub ai_model: String,
+    pub query_model: String,
     pub ding_app_key: String,
     pub ding_app_secret: String,
 }
@@ -203,6 +204,8 @@ pub struct DbTablePreviewPayload {
     pub remark: String,
     pub columns: Vec<String>,
     pub preview_data: Vec<Vec<String>>,
+    #[serde(default)]
+    pub column_remarks: std::collections::HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -286,122 +289,151 @@ const SYSTEM_PROMPT: &str = r#"你是一位专业的数据分析助手。用户�
 - 仅返回 JSON，不要任何解释文字。
 "#;
 
-const WORKBENCH_SYSTEM_PROMPT: &str = r#"你是一位数据入库与看板设计专家。用户会上传表格数据并与你对话。
+const WORKBENCH_SYSTEM_PROMPT: &str = r#"你是一位数据看板设计与可视化开发专家。用户会上传表格数据或选择已有数据库表，并与你对话。
 你的任务是：
-1. 分析表格结构，理解每个字段的含义
-2. 建议合理的表名（英文小写+下划线）
-3. 建议字段类型优化（如果某些列应该是数字/日期）
-4. 提供SQL清洗语句（处理空值、格式转换等）
-5. 回答用户关于数据的任何问题
-6. 当用户需求清晰后，直接输出可落地的数据看板配置
+1. 理解用户的数据结构与字段含义（含中文备注）
+2. 设计可视化方案（图表选型、聚合维度、筛选器布局、汇总卡片）
+3. 当用户需求清晰、可以输出看板时，**直接产出一段完整可运行的 HTML 文档作为最终交付物**
 
-【强制规则 — 违反将导致系统无法执行】
-1. 当用户需要创建看板时，在回复的**最末尾**必须输出一段可执行的JSON。
-2. JSON格式**必须**严格如下（不要换行，不要markdown代码块，直接输出纯文本JSON）：
-{"action":"create_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT ...","ui_filters":[{"id":"字段名","label":"中文标签","type":"input|select|multi_select|date_range|search","options":["选项1","选项2"],"default":"选项1"}],"charts":["pie","bar","line","table"],"actions":["export_csv"],"summary_cards":[{"title":"总销售额","field":"amount","agg":"sum"}],"source_table":"数据表名"}}
-3. source_table 字段用于关联看板和数据库表，请填写 SQL 中实际查询的表名。
-4. 如果用户要求修改已有看板，输出格式必须是：
-{"action":"update_dashboard","dashboard":{"name":"...","sql_template":"...","ui_filters":[...],"charts":[...],"actions":[...],"summary_cards":[...]}}
-5. update_dashboard 中严禁包含 table_data 字段，table_data 由系统从数据库自动查询填充。
-6. 严禁使用markdown代码块（如 ```json）包裹JSON，系统只识别纯文本JSON。
-7. 只包含**需要设置/修改**的字段，不需要的字段**不要**出现在JSON中。
+【输出格式 — 强制规则】
+1. 创建看板时，必须在回复**最末尾**输出一个完整的 HTML 代码块，使用三个反引号 + html 标记包裹：
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>...</head>
+<body>...</body>
+</html>
+```
+2. 系统只识别 ```html 代码块（小写 html），不识别其他语言标记或纯文本。
+3. HTML 必须是**完整文档**，含 <!DOCTYPE html>、<html>、<head>、<body>，不能是片段。
+4. 严禁输出任何 JSON action（如 {"action":"create_dashboard"} ），系统已不再支持 JSON 流程。
+5. 解释性文字可以放在 HTML 代码块之前，但 HTML 必须是整段回复**最后**一个代码块。
 
-【ui_filters 类型说明】
-- input: 普通文本输入框。
-- select: 单选下拉框，options 为该字段的去重值（可省略由前端自动生成）。
-- multi_select: 多选复选框，值用逗号分隔，SQL 中用 IN ({{id}}) 接收。
-- date_range: 日期范围，SQL 中会生成 {{id}}_start 和 {{id}}_end 两个变量，用 BETWEEN 接收。
-- search: 模糊搜索，SQL 中用 LIKE '%{{id}}%' 接收。
+【HTML 数据接入约定 — 必须严格遵守】
+渲染时后端会自动把源数据表的全部行注入到 window.__dashboardData（数组，每个元素**同时**带英文列名 key 和中文备注 key——只要列有中文备注，那一行就既能 row["order_date"] 也能 row["下单日期"] 取到值），并尝试调用 runAnalysisLogic(anchorId)。所以：
+1. 在 <script> 中**必须定义** window.rawExcelData 与 runAnalysisLogic(anchorId) 函数：
+   - 函数内读取 window.__dashboardData（fallback 到 window.rawExcelData）作为数据源；
+   - 函数负责把数据计算成 ECharts option 并渲染到对应的 DOM 容器；
+   - 函数还应处理筛选器变化（绑定 change/input 事件后再次调用自身或一个 reRender 子函数）。
+2. 提供一个 <input id="anchorId" type="hidden"> 作为兼容字段（系统会写入值，可不读取）。
+3. 不要在 HTML 中硬编码示例数据用于生产展示（仅可作为兜底；正式数据由 __dashboardData 提供）。
+4. 通过 CDN 引入 ECharts 5：<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>。
+5. 数据 key 任选一种风格即可：**优先使用英文原列名**（与 preview 的 columns / column_remarks key 完全一致，最不易出错）；如果你想用中文 key 必须使用 column_remarks 给出的精确中文备注，**禁止根据列含义自行编造中文名**（编出来的 key 数据里没有，图表会空）。同一份 HTML 内 key 风格保持一致。
 
-【summary_cards 说明】
-- 用于在看板顶部显示聚合统计卡片。
-- agg 支持 sum、avg、count、max、min。
-- field 为 SQL 查询结果中的列名。
+【HTML 设计建议】
+- 推荐结构：顶部统计卡片区 → 筛选区（select / 日期范围 / 搜索）→ 主图表网格（2~4 张图）→ 明细表格（可选）。
+- 样式：使用 inline <style> 写简洁、专业的 CSS（建议浅色卡片 + 轻量阴影 + 圆角），避免引入外部 CSS 框架。
+- 全文中文，文案专业、有数据可观察的洞察提示。
+- 图表选型基于业务：分类对比用柱状/条形，趋势用折线/面积，构成用饼/环，分布用散点/直方。
 
-【SQLite 语法 — 必须遵守，违反将直接导致看板报错】
-- 数据库是 SQLite，不是 MySQL。所有 sql_template 必须 SQLite 语法。
-- 禁止 GROUP_CONCAT(... SEPARATOR x)，必须改用 GROUP_CONCAT(expr, '分隔符')（逗号分隔）
-- 禁止 DATE_FORMAT，改用 strftime('%Y-%m-%d', col)
-- 字符串拼接用 ||，不能用 CONCAT(...)
-- 禁止 LIMIT n,m 写法，改用 LIMIT n OFFSET m
-- 没有 IF(cond, a, b)，用 CASE WHEN cond THEN a ELSE b END 或 IIF
-- 禁止 RIGHT/LEFT(str, n)，改用 substr(str, ...)
+【SQL / 计算约定】
+- 所有聚合、筛选都在前端 JS 中完成（基于 __dashboardData 数组），不需要写 SQL。
+- 数值字段在 __dashboardData 中是字符串，请使用 Number(x) 或 parseFloat 做转换。
+- 日期字段也是字符串，建议用 new Date(x) 或字符串比较处理。
+
+【交互节奏】
+- 如果用户需求清晰，可以直接给出 HTML 代码块。
+- 如果模糊，先用【关键提问】引导（见交互引导模式提示），但**最终一定要输出完整 HTML 代码块**。
 "#;
 
 const THOUGHT_GUIDE_SYSTEM_PROMPT: &str = r#"# Role
-你现在处于特殊的【交互引导模式】。你的名字是小妮。面对用户丢过来的模糊问题或一句话需求，你现在的座右铭是：“需求不清晰，代码/文案跑偏一万米”。
+你现在处于特殊的【交互引导模式】。你的名字是小妮。面对用户丢过来的模糊问题或一句话需求，你现在的座右铭是：“需求不清晰，看板/分析跑偏一万米”。
 
 # Core Directive (核心行为准则)
-1. 绝对不要急于给最终答案：当用户开启此模式时，说明他们自己也没完全想清楚。你必须先压制住“立刻回答”的冲动。
-2. 剥洋葱式提问：仔细阅读用户的输入，思考在业务逻辑、技术边界、目标受众或应用场景上，还有哪些关键信息缺失。
-3. 提问数量限制：每次回复向用户抛出 1 到 5 个最核心的澄清问题（由你根据缺失信息的严重程度决定，但绝不能超过 5 个），并等待用户回答。
-4. 允许连问：如果用户回答后，你认为依然有逻辑漏洞或关键细节缺失，可以继续提问，直到你认为“需求已经像咱们的无菌车间一样清晰透彻”为止。
-5. 闭环输出：只有当你确信已经掌握了100%的必要信息后，才正式结束提问，并给出一份高质量、零Bug、可落地的最终方案。这个方案可以直接是数据看板配置（JSON格式）、SQL语句或数据分析报告。
+1. 绝对不要急于给最终答案：当用户开启此模式时，说明他们自己也没完全想清楚。你必须先压制住"立刻回答"的冲动。
+2. 剥洋葱式提问：仔细阅读用户输入，思考在业务逻辑、可视化目标、数据维度或受众场景上还有哪些关键信息缺失。
+3. 提问数量限制：每次回复向用户抛出 1 到 5 个最核心的澄清问题（不超过 5 个），并等待用户回答。
+4. 允许连问：如果用户回答后你认为依然有逻辑漏洞或关键细节缺失，可以继续提问。轮次没有硬上限，由你自行判断；但**一旦信息齐全就要立刻闭环**，不要为了提问而提问。
+5. 闭环输出：只有当你确信已经掌握 100% 必要信息后，才正式结束提问，并给出**一段完整可运行的 HTML 看板代码块**作为最终交付物。
 
 # Tone & Style (语气与风格)
-- 保持非常理性的态度，分析模糊的需求。
-- 提问要一针见血：不要问废话，每个问题都要直击痛点。
+- 保持理性、专业，分析模糊需求时不卖弄术语。
+- 提问要一针见血：每个问题都直击痛点，不要废话。
 
 # Interaction Format (交互格式标准)
-请务必在有提问的回答里都写上下面中括号中的标题，不要漏掉。给出最终结果时不需要写。
-1. 【诊断反馈】：用一两句话幽默地总结一下你对当前需求的“体检报告”（比如觉得哪里太虚、哪里没兜底）。
-2. 【关键提问】：使用编号列表（1, 2, 3...）列出你的问题，最多5个。每个问题必须附带 A/B/C/D 选项（单行排列，如 A. 选项一 B. 选项二 C. 选项三），如果问题不适合出选项，也至少给出2个常见选项加“其它”。选项格式为：换行后 A. 选项内容、B. 选项内容……
-3. 【提醒】：提醒用户不要忘记回复你的问题。
+当本轮还要继续追问时，**必须**带上下面三个中括号小节，缺一不可：
+1. 【诊断反馈】：用一两句话总结你对当前需求的"体检报告"（哪里太虚、哪里没兜底）。
+2. 【关键提问】：使用编号列表（1, 2, 3...）列出你的问题，最多 5 个。每个问题附带 A/B/C/D 选项（单行排列，如 A. 选项一 B. 选项二 C. 选项三）；不适合出选项时也至少给 2 个常见选项加"其它"。
+3. 【提醒】：温和提醒用户回复你的问题。
 
-【绝对红线 — 违反将导致系统无法执行】
-- 累计提问轮次不得超过 3 轮。第 4 轮起必须直接输出 create_dashboard JSON，不再继续提问。
-- 如果用户已经提供了足够信息，立刻输出 JSON，不要继续追问。
+当**已经收集到足够信息、可以输出最终方案**时，不再写以上三个小节，而是：
+- 简短一两句话说明你的设计思路（聚焦哪些指标、用哪些图表）；
+- 在回复**最末尾**输出一段**完整可运行的 HTML 看板代码块**：
 
-【create_dashboard JSON 格式 — 必须严格遵守，一字不差】
-当需要输出看板配置时，在回复最末尾输出纯文本 JSON（严禁 markdown 代码块），格式如下：
-{"action":"create_dashboard","dashboard":{"name":"看板名称","description":"描述","sql_template":"SELECT * FROM 表名 WHERE 条件","ui_filters":[{"field":"列名","label":"中文标签","type":"select|multi_select|date_range|input|search"}],"charts":["pie","bar","line","table"],"actions":["export_csv"],"summary_cards":[{"title":"总销售额","field":"amount","agg":"sum"}],"source_table":"数据库表名"}}
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>看板标题</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>/* 简洁专业的样式 */</style>
+</head>
+<body>
+  <input id="anchorId" type="hidden" />
+  <!-- 顶部统计卡片 / 筛选器 / 主图表 / 明细表 -->
+  <script>
+    window.rawExcelData = window.rawExcelData || [];
+    function runAnalysisLogic(anchorId) {
+      const data = (window.__dashboardData && window.__dashboardData.length)
+        ? window.__dashboardData
+        : window.rawExcelData;
+      // 基于 data 计算并渲染所有图表
+    }
+  </script>
+</body>
+</html>
+```
 
-字段说明：
-- name：看板名称（字符串，必填）。
-- sql_template：SQLite 查询语句（字符串，必填）。
-- ui_filters：筛选器配置数组（可选）。type 可选 input/select/multi_select/date_range/search。
-- charts：图表类型数组（字符串数组，可选）。每个元素只能是 "pie"/"bar"/"line"/"table" 之一，严禁使用对象或自定义类型如 "stacked_bar"。
-- actions：操作按钮数组（字符串数组，可选）。只能填 "export_csv" 或 "export_excel"。
-- summary_cards：顶部统计卡片数组（可选）。agg 支持 sum/avg/count/max/min。
-- source_table：数据库表名（字符串，必填），必须与 sql_template 中查询的表名一致。
-- 严禁在 dashboard 对象外使用 title、sheet_name、filters、calculated_fields、default_sort 等字段名。
-- 严禁输出 markdown 代码块（```json），只输出纯文本 JSON。
+【输出 HTML 时的硬规则】
+- 必须使用 ```html 代码块包裹（系统只识别小写 html 标记）。
+- 必须是完整 <!DOCTYPE html> 文档，不能是片段。
+- 必须定义 window.rawExcelData 与 runAnalysisLogic(anchorId)，因为系统会自动注入 window.__dashboardData 并尝试调用此函数。
+- 数据 key 使用**英文原列名**（推荐，最稳）或 column_remarks 给出的**精确中文备注**（不要自行根据含义造中文名，造出来的 key 数据里没有）。整份 HTML 用统一一种风格。
+- 数值字段是字符串，需用 Number() / parseFloat 转换。
+- 严禁输出任何 JSON action（如 {"action":"create_dashboard"}），系统已废弃 JSON 流程。
+
+【绝对红线】
+- 不要在带【关键提问】的回复里输出 HTML 代码块。
+- 不要把 HTML 代码块的内容塞进【诊断反馈】或【关键提问】里。
+- 输出 HTML 后再补一句"如需调整告诉我"即可，不要再追加问题。
 "#;
 
-const MODIFICATION_SYSTEM_PROMPT: &str = r#"你是一位数据看板修改专家。用户正在修改一个已有的数据看板。
+const MODIFICATION_SYSTEM_PROMPT: &str = r#"你是一位数据看板修改专家。用户正在修改一个已有的数据看板，并已把当前看板的 HTML 源码与源数据预览随请求一并提供给你。
 
 【数据保护 — 绝对禁止】
-1. 严禁清空或替换用户的现有数据。
+1. 严禁清空或替换用户的源数据库数据。
 2. 你没有权限删除数据库中的任何记录。
-3. 如果你不确定某个字段的当前值，绝对不要在JSON中包含该字段。
-4. table_data 字段由系统从数据库自动查询填充，你绝对不要提供或修改 table_data，即使为空数组也不行。
+3. 不要修改数据 key 的中文列名（必须与原版一致，否则数据注入会失效）。
 
-【强制规则 — 违反将导致系统无法执行】
-5. 分析用户修改需求后，在回复的最末尾必须输出一段可执行的JSON。
-6. JSON格式必须严格如下（不要换行，不要markdown代码块，直接输出纯文本JSON）：
-{"action":"update_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT ...","ui_filters":[{"id":"字段名","label":"中文标签","type":"input|select|multi_select|date_range|search","options":["选项1","选项2"]}],"charts":["pie","bar","line","table"],"actions":["export_csv"],"summary_cards":[{"title":"总销售额","field":"amount","agg":"sum"}]}}
-7. 只包含用户明确要求修改的字段。未提及的字段绝对不要出现在JSON中。
-8. table_data 严禁出现在 update_dashboard 的JSON中。
-9. sql_template中的变量使用{{id}}双大括号占位。
-10. 如果用户只是闲聊或没有明确的修改需求，不要输出JSON，只回复文字即可。
-11. 严禁使用markdown代码块（如 ```json）包裹JSON，系统只识别纯文本JSON。
-12. 解释性文字可以放在JSON之前，但JSON必须放在整段回复的最后。
+【输出格式 — 强制规则】
+1. 在分析用户的修改需求后，**始终输出一段完整可运行的新 HTML 文档**，使用三个反引号 + html 包裹：
+```html
+<!DOCTYPE html>
+<html lang="zh-CN">
+...
+</html>
+```
+2. **必须**输出完整 HTML，不能输出 diff、片段或"在原 HTML 第 X 行加 Y"。
+3. 严禁输出 JSON action（如 {"action":"update_dashboard"}），系统已废弃 JSON 流程。
+4. 严禁使用其他语言标记（如 ```javascript 单独片段）替代完整 HTML。
+5. 解释性文字可以放在 HTML 代码块之前，但 HTML 代码块必须是整段回复**最后**一个代码块。
+6. 如果用户只是闲聊或没有明确的修改需求，**不要**输出 HTML 代码块，只回复文字即可。
 
-【ui_filters 类型说明】
-- input: 普通文本输入框。
-- select: 单选下拉框。
-- multi_select: 多选复选框，值用逗号分隔，SQL 中用 IN ({{id}}) 接收。
-- date_range: 日期范围，SQL 中会生成 {{id}}_start 和 {{id}}_end 两个变量，用 BETWEEN 接收。
-- search: 模糊搜索，SQL 中用 LIKE '%{{id}}%' 接收。
+【保留约定 — 必须保留】
+新 HTML 必须保持以下要素，否则看板无法正常渲染：
+- 完整 <!DOCTYPE html> 文档结构。
+- 通过 CDN 引入 ECharts 5（https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js）。
+- <input id="anchorId" type="hidden"> 兼容字段。
+- 定义 window.rawExcelData（默认值 []）。
+- 定义 runAnalysisLogic(anchorId) 函数：内部应优先读 window.__dashboardData，回退到 window.rawExcelData，并据此重渲染所有图表与表格。
+- 数据 key 使用与原 HTML **完全一致**的命名（原版用英文 key 就继续用英文，原版用中文 key 就继续用对应中文备注），禁止换风格——换了 key 数据立刻读不到。
 
-【SQLite 语法 — 必须遵守，违反将直接导致看板报错】
-- 数据库是 SQLite，不是 MySQL。所有 sql_template 必须 SQLite 语法。
-- 禁止 GROUP_CONCAT(... SEPARATOR x)，必须改用 GROUP_CONCAT(expr, '分隔符')（逗号分隔）
-- 禁止 DATE_FORMAT，改用 strftime('%Y-%m-%d', col)
-- 字符串拼接用 ||，不能用 CONCAT(...)
-- 禁止 LIMIT n,m 写法，改用 LIMIT n OFFSET m
-- 没有 IF(cond, a, b)，用 CASE WHEN cond THEN a ELSE b END 或 IIF
-- 禁止 RIGHT/LEFT(str, n)，改用 substr(str, ...)
+【修改建议】
+- 优先在原 HTML 基础上做最小改动：保留布局骨架与 DOM ID，只替换图表逻辑或样式。
+- 如果用户只要"把饼图改成柱状图"这种局部需求，不要顺手重写其它部分。
+- 数值字段在 __dashboardData 中是字符串，记得用 Number() / parseFloat 转换再聚合。
+- 全文中文，UI 风格保持简洁专业。
 "#;
 
 #[tauri::command]
@@ -543,7 +575,7 @@ async fn chat_workbench(
     };
 
     if db_table_previews.is_some() {
-        system_content.push_str("\n\n【数据库表查询能力】当前已提供数据库表结构和预览数据。如果你需要额外查询数据库来回答用户问题，可以在回复末尾附加 JSON: {\"action\":\"run_sql\",\"sql\":\"SELECT ...\"}（仅允许 SELECT）。系统会执行 SQL 并把结果返回给你，然后你再给出最终回答。");
+        system_content.push_str("\n\n【数据库表查询能力】当前已提供数据库表结构和预览数据。请基于这些预览理解数据并设计可视化方案；最终请直接输出完整 HTML 看板代码块，不要再返回任何 JSON action。");
     }
 
     let mut chat_messages: Vec<ChatMessage> = vec![ChatMessage {
@@ -567,15 +599,26 @@ async fn chat_workbench(
 
     if let Some(db_previews) = db_table_previews {
         for p in &db_previews {
+            // 列级中文备注：优先用前端传来的；为空时回退查 DB，避免 AI 看不到列名 → 中文 key 的对应关系
+            let column_remarks: std::collections::HashMap<String, String> =
+                if !p.column_remarks.is_empty() {
+                    p.column_remarks.clone()
+                } else {
+                    get_column_remarks(p.table_name.clone()).unwrap_or_default()
+                };
             let preview_json = serde_json::to_string(&serde_json::json!({
                 "table_name": p.table_name,
                 "remark": p.remark,
                 "columns": p.columns,
+                "column_remarks": column_remarks,
                 "preview_data": p.preview_data,
             })).unwrap_or_default();
             chat_messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: serde_json::Value::String(format!("数据库表 [{}] 预览数据:\n{}", p.table_name, preview_json)),
+                content: serde_json::Value::String(format!(
+                    "数据库表 [{}] 预览数据（columns 是英文列名；column_remarks 是 英文列名→中文备注 映射；运行时 window.__dashboardData 的每一行**同时**带英文 key 和中文 key，请任选一种作为数据 key 使用，但同一份 HTML 内必须保持一致）:\n{}",
+                    p.table_name, preview_json
+                )),
             });
         }
         println!("[chat_workbench] 已注入 {} 张数据库表预览", db_previews.len());
@@ -634,7 +677,7 @@ async fn chat_workbench(
     if modifying_dashboard.unwrap_or(false) {
         chat_messages.push(ChatMessage {
             role: "system".to_string(),
-            content: serde_json::Value::String("【最终提醒】你现在必须输出update_dashboard的JSON。只包含用户明确要求修改的字段，严禁碰table_data，严禁清空现有配置。JSON放在回复最后，不要markdown代码块。".to_string()),
+            content: serde_json::Value::String("【最终提醒】你现在必须在回复最末尾输出一段完整可运行的新 HTML 文档（用 ```html 代码块包裹）。必须保留 window.rawExcelData、runAnalysisLogic(anchorId)、<input id=\"anchorId\">、ECharts CDN，**数据 key 风格与原 HTML 保持完全一致**（原来用英文 key 就继续用英文，用中文备注就继续用同一中文备注，禁止换风格）。严禁输出任何 JSON action，严禁输出片段或 diff，必须是完整 <!DOCTYPE html> 文档。".to_string()),
         });
         println!("[chat_workbench] 已注入修改模式最终提醒");
     }
@@ -896,6 +939,17 @@ fn init_db() -> Result<rusqlite::Connection, String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // 外部Python入库后的刷新信号表
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _detabu_refresh_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(conn)
 }
 
@@ -1139,14 +1193,21 @@ async fn render_html_dashboard(dashboard_id: String) -> Result<String, String> {
     let sql = format!(r#"SELECT * FROM "{}""#, source_table);
     let query_result = run_sql_query(&sql)?;
 
-    // 3. 转换数据格式：英文列名 → 中文列名
+    // 3. 转换数据格式：每行同时带英文列名 key 和中文备注 key（如果该列有中文备注），
+    //    避免 AI 生成的 HTML 不知道用英文还是中文 key 时数据落空。
     let mut data: Vec<serde_json::Map<String, serde_json::Value>> = Vec::with_capacity(query_result.rows.len());
     for row in &query_result.rows {
         let mut obj = serde_json::Map::new();
         for (i, col) in query_result.columns.iter().enumerate() {
-            let chinese_name = remarks.get(col).cloned().unwrap_or_else(|| col.clone());
             let val = row.get(i).cloned().unwrap_or_default();
-            obj.insert(chinese_name, serde_json::Value::String(val));
+            // 英文原列名 key（始终写入）
+            obj.insert(col.clone(), serde_json::Value::String(val.clone()));
+            // 中文备注 key（存在且与英文名不同才写入，避免覆盖）
+            if let Some(chinese_name) = remarks.get(col) {
+                if chinese_name != col && !chinese_name.is_empty() {
+                    obj.insert(chinese_name.clone(), serde_json::Value::String(val));
+                }
+            }
         }
         data.push(obj);
     }
@@ -1191,6 +1252,34 @@ async fn render_html_dashboard(dashboard_id: String) -> Result<String, String> {
     html = html.replace("</body>", &format!("{}</body>", auto_script));
 
     Ok(html)
+}
+
+#[tauri::command]
+fn check_refresh_signals() -> Result<Vec<String>, String> {
+    let conn = init_db()?;
+
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT table_name FROM _detabu_refresh_signals")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(0)?;
+            Ok(name)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut table_names = Vec::new();
+    for row in rows {
+        if let Ok(name) = row {
+            table_names.push(name);
+        }
+    }
+    drop(stmt);
+
+    conn.execute("DELETE FROM _detabu_refresh_signals", [])
+        .map_err(|e| e.to_string())?;
+
+    Ok(table_names)
 }
 
 #[tauri::command]
@@ -3064,6 +3153,7 @@ const HTML_DASHBOARD_DESIGN_SYSTEM_PROMPT: &str = r#"你是 SQLite 数据看板�
 {
   "action": "create_dashboard",
   "name": "看板中文名",
+  "description": "简短描述（50字以内），说明这个看板主要展示什么业务数据和分析价值",
   "source_table": "主表英文名",
   "sql_template": "完整可执行的 SELECT 语句，可包含 {{filter_id}} 占位符",
   "ui_filters": [{"id":"filter_id","label":"中文","type":"input|select","default":"可选默认值"}],
@@ -3110,6 +3200,14 @@ fn dashboard_ai_url(config: &AppConfig) -> String {
         format!("{}v1/chat/completions", config.ai_url)
     } else {
         format!("{}/v1/chat/completions", config.ai_url)
+    }
+}
+
+fn resolve_query_model(config: &AppConfig) -> String {
+    if config.query_model.is_empty() {
+        config.ai_model.clone()
+    } else {
+        config.query_model.clone()
     }
 }
 
@@ -3551,6 +3649,10 @@ async fn create_dashboard_from_template(
         .map(String::from)
         .or_else(|| dashboard_name.clone())
         .unwrap_or_else(|| "未命名看板".to_string());
+    let description = dashboard_value
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let sql_template = dashboard_value
         .get("sql_template")
         .and_then(|v| v.as_str())
@@ -3569,7 +3671,7 @@ async fn create_dashboard_from_template(
 
     let dashboard_id = create_dashboard(
         final_name.clone(),
-        None,
+        description,
         sql_template,
         ui_filters,
         charts,
@@ -3606,6 +3708,294 @@ fn rollback_created_tables(table_names: Vec<String>) -> Result<(), String> {
         let _ = drop_user_table(t);
     }
     Ok(())
+}
+
+/// 基于 AI 已经写好的完整 HTML 创建看板：
+/// - 仍然走 Stage B/C/D 把 new_files 入库（如果有），并写中文备注；
+/// - 跳过 Stage E（AI 不再设计 JSON 看板配置）；
+/// - Stage F 直接用用户给的 html_content 落库，source_table 选第一张新建表，否则第一张 existing_tables。
+#[tauri::command]
+async fn create_dashboard_from_ai_html(
+    app: tauri::AppHandle,
+    html_content: String,
+    new_files: Vec<NewFileSpec>,
+    existing_tables: Vec<String>,
+    dashboard_name: Option<String>,
+) -> Result<CreateDashboardResult, String> {
+    let config = load_config(app.clone()).await?;
+    if config.ai_url.is_empty() || config.ai_key.is_empty() {
+        return Err("请先配置 AI 接口地址和 API Key".to_string());
+    }
+
+    if html_content.trim().is_empty() {
+        return Err("AI 没有返回 HTML 内容".to_string());
+    }
+
+    let mut warnings: Vec<String> = vec![];
+    let mut created_tables: Vec<String> = vec![];
+
+    // ------ Stage B: 读取每个文件预览 ------
+    let mut file_previews: Vec<serde_json::Value> = vec![];
+    if !new_files.is_empty() {
+        emit_create_progress(
+            &app,
+            "read_data",
+            &format!("正在读取 {} 个数据文件", new_files.len()),
+            serde_json::Value::Null,
+        );
+        for (i, f) in new_files.iter().enumerate() {
+            emit_create_progress(
+                &app,
+                "read_data",
+                &format!("读取文件 {}/{}: {}", i + 1, new_files.len(), f.file_path),
+                serde_json::json!({"current": i+1, "total": new_files.len()}),
+            );
+            let preview = parse_excel(f.file_path.clone())
+                .await
+                .map_err(|e| format!("解析 {} 失败: {}", f.file_path, e))?;
+            let sheet = preview
+                .sheets
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("文件 {} 没有有效工作表", f.file_path))?;
+            file_previews.push(serde_json::json!({
+                "file_path": f.file_path,
+                "target_table_name": f.target_table_name,
+                "columns": sheet.columns,
+                "preview_rows": sheet.preview_data.into_iter().take(5).collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    // ------ Stage C+D: 如果有新文件，让 AI 设计建表方案并入库 ------
+    let mut new_table_specs: Vec<(String, String, std::collections::HashMap<String, String>)> =
+        vec![];
+    if !new_files.is_empty() {
+        emit_create_progress(
+            &app,
+            "ai_design_tables",
+            "AI 正在设计建表方案",
+            serde_json::Value::Null,
+        );
+
+        let url = dashboard_ai_url(&config);
+        let model = if config.ai_model.is_empty() {
+            "deepseek-chat".to_string()
+        } else {
+            config.ai_model.clone()
+        };
+        let client = reqwest::Client::new();
+
+        let existing_table_names_str = existing_tables.join(", ");
+        let user_prompt = format!(
+            "【AI 已生成的看板 HTML 摘要（仅供你判断字段口径，不要复述）】\n（已省略，仅根据下方文件预览设计建表）\n\n【现有数据库表名（避免冲突）】\n{}\n\n【需要新建的数据文件预览】\n{}\n\n【重要提醒】\n每个文件预览里的 \"columns\" 就是 temp_table 的精确列名，你的 clean_sql 中 SELECT 子句必须一字不差地使用这些列名，禁止改名或增减列。请按系统消息中的 JSON 格式返回建表方案。",
+            existing_table_names_str,
+            serde_json::to_string_pretty(&file_previews).unwrap_or_default()
+        );
+
+        let mut ai_value: Option<serde_json::Value> = None;
+        for attempt in 1..=2 {
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", config.ai_key))
+                .json(&ChatRequest {
+                    model: model.clone(),
+                    messages: vec![
+                        ChatMessage {
+                            role: "system".into(),
+                            content: HTML_TABLE_DESIGN_SYSTEM_PROMPT.into(),
+                        },
+                        ChatMessage {
+                            role: "user".into(),
+                            content: serde_json::Value::String(user_prompt.clone()),
+                        },
+                    ],
+                    temperature: 0.1,
+                })
+                .send()
+                .await
+                .map_err(|e| format!("请求 AI 失败: {}", e))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if attempt == 2 {
+                    return Err(format!("AI 接口返回错误 {}: {}", status, text));
+                }
+                continue;
+            }
+            let completion: ChatCompletion = resp
+                .json()
+                .await
+                .map_err(|e| format!("解析 AI 响应失败: {}", e))?;
+            let raw = completion
+                .choices
+                .get(0)
+                .map(|c| c.message.content.clone())
+                .unwrap_or_default();
+            match parse_ai_json(&raw) {
+                Ok(v) => {
+                    ai_value = Some(v);
+                    break;
+                }
+                Err(_) if attempt < 2 => continue,
+                Err(e) => return Err(format!("AI 建表方案 JSON 解析失败: {}", e)),
+            }
+        }
+        let ai_value = ai_value.ok_or("AI 未返回建表方案")?;
+
+        let tables_arr = ai_value
+            .get("tables")
+            .and_then(|v| v.as_array())
+            .ok_or("AI 返回缺少 tables 字段")?;
+        for t in tables_arr {
+            let table_name = t
+                .get("table_name")
+                .and_then(|v| v.as_str())
+                .ok_or("table_name 缺失")?
+                .to_string();
+            let clean_sql = t
+                .get("clean_sql")
+                .and_then(|v| v.as_str())
+                .ok_or("clean_sql 缺失")?
+                .to_string();
+            let mut remarks: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            if let Some(remarks_obj) = t.get("column_remarks").and_then(|v| v.as_object()) {
+                for (k, v) in remarks_obj {
+                    if let Some(s) = v.as_str() {
+                        remarks.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+            new_table_specs.push((table_name, clean_sql, remarks));
+        }
+
+        for (i, (table_name, clean_sql, remarks)) in new_table_specs.iter().enumerate() {
+            emit_create_progress(
+                &app,
+                "create_tables",
+                &format!(
+                    "正在创建表 {}/{}: {}",
+                    i + 1,
+                    new_table_specs.len(),
+                    table_name
+                ),
+                serde_json::json!({"table": table_name, "current": i+1, "total": new_table_specs.len()}),
+            );
+
+            let file_spec = new_files
+                .iter()
+                .find(|f| &f.target_table_name == table_name)
+                .or_else(|| new_files.get(i))
+                .ok_or_else(|| format!("找不到表 {} 对应的源文件", table_name))?;
+
+            ingest_full_data(
+                app.clone(),
+                file_spec.file_path.clone(),
+                clean_sql.clone(),
+                table_name.clone(),
+            )
+            .await
+            .map_err(|e| format!("导入 {} 数据失败: {}", table_name, e))?;
+
+            created_tables.push(table_name.clone());
+
+            for (col, remark) in remarks {
+                let _ = set_column_remark(table_name.clone(), col.clone(), remark.clone());
+            }
+        }
+    }
+
+    // ------ 跳过 Stage E（AI 不再设计 JSON 看板配置）------
+
+    // ------ Stage F: 直接用 AI 给的 HTML 落库 ------
+    emit_create_progress(
+        &app,
+        "finalize",
+        "正在保存看板",
+        serde_json::Value::Null,
+    );
+
+    let source_table = created_tables
+        .first()
+        .cloned()
+        .or_else(|| existing_tables.first().cloned())
+        .ok_or("缺少 source_table：既没有新建表，也没有选择已有表")?;
+
+    let final_name = dashboard_name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "AI 生成看板".to_string());
+
+    // 生成看板描述（使用查询模型，失败不阻塞）
+    let dashboard_description = if !html_content.is_empty() {
+        let desc_prompt = format!(
+            "请根据以下数据看板 HTML 内容，生成一段简短的看板描述（30-80字），说明这个看板主要展示什么业务数据、有什么分析价值。只返回描述文本，不要加引号或其他格式。\n\nHTML 内容前 800 字符：\n{}\n关联数据表：{}",
+            html_content.chars().take(800).collect::<String>(),
+            source_table
+        );
+        let url = dashboard_ai_url(&config);
+        let model = resolve_query_model(&config);
+        let client = reqwest::Client::new();
+        let req_body = ChatRequest {
+            model,
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(desc_prompt),
+            }],
+            temperature: 0.3,
+        };
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", config.ai_key))
+            .json(&req_body)
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json::<ChatCompletion>().await {
+                Ok(completion) => completion
+                    .choices
+                    .get(0)
+                    .map(|c| c.message.content.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != "null"),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let dashboard_id = create_dashboard(
+        final_name.clone(),
+        dashboard_description,
+        None,
+        None,
+        None,
+        None,
+        Some(source_table.clone()),
+        None,
+        None,
+        Some(html_content.clone()),
+    )
+    .await?;
+
+    emit_create_progress(
+        &app,
+        "done",
+        "看板创建完成",
+        serde_json::json!({
+            "dashboard_id": dashboard_id,
+            "dashboard_name": final_name,
+            "created_tables": created_tables.clone(),
+        }),
+    );
+
+    Ok(CreateDashboardResult {
+        dashboard_id,
+        dashboard_name: final_name,
+        created_tables,
+        warnings,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3660,10 +4050,12 @@ pub fn run() {
             save_table_mappings,
             compress_html_for_ai,
             create_dashboard_from_template,
+            create_dashboard_from_ai_html,
             rollback_created_tables,
             rollback_dashboard,
             log_to_terminal,
             render_html_dashboard,
+            check_refresh_signals,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
