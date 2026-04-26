@@ -44,11 +44,29 @@ export interface Dashboard {
   updated_at: string;
 }
 
+export interface NewFileSpec {
+  file_path: string;
+  target_table_name: string;
+}
+
+export interface PendingDashboard {
+  id: string;
+  name: string;
+  html_content: string;
+  new_files: NewFileSpec[];
+  existing_tables: string[];
+  source: string;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 interface AppState {
   activeView: ViewType;
   sessions: Session[];
   currentSessionId: string | null;
   dashboards: Dashboard[];
+  pendingDashboards: PendingDashboard[];
   currentDashboardId: string | null;
   boardsSelectedId: string | null;
   workbenchDashboardTag: string | undefined;
@@ -62,6 +80,7 @@ interface AppState {
   setWorkbenchDashboardTag: (tag: string | undefined) => void;
   refreshSessions: () => Promise<void>;
   refreshDashboards: () => Promise<void>;
+  refreshPendingDashboards: () => Promise<void>;
   refreshBotStatus: () => Promise<void>;
 }
 
@@ -72,6 +91,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
+  const [pendingDashboards, setPendingDashboards] = useState<PendingDashboard[]>([]);
   const [currentDashboardId, setCurrentDashboardId] = useState<string | null>(null);
   const [boardsSelectedId, setBoardsSelectedId] = useState<string | null>(null);
   const [workbenchDashboardTag, setWorkbenchDashboardTag] = useState<string | undefined>(undefined);
@@ -94,6 +114,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setDashboards(res);
     } catch (e) {
       console.error("Failed to load dashboards:", e);
+    }
+  }, []);
+
+  const refreshPendingDashboards = useCallback(async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const res = await invoke<PendingDashboard[]>("list_pending_dashboards");
+      setPendingDashboards(res);
+    } catch (e) {
+      console.error("Failed to load pending dashboards:", e);
     }
   }, []);
 
@@ -134,6 +164,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         sessions,
         currentSessionId,
         dashboards,
+        pendingDashboards,
         currentDashboardId,
         boardsSelectedId,
         workbenchDashboardTag,
@@ -147,6 +178,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setWorkbenchDashboardTag,
         refreshSessions,
         refreshDashboards,
+        refreshPendingDashboards,
         refreshBotStatus,
       }}
     >

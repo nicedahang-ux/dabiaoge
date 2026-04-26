@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AI表格转看板",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.aiexcel.kanban",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,7 +30,9 @@
             "updater:allow-install",
             "updater:allow-download-and-install",
             "opener:allow-open-url",
-            "opener:allow-open-path"
+            "opener:allow-open-path",
+            "dialog:allow-open",
+            "dialog:default"
           ]
         }
       ]
@@ -61,7 +63,7 @@
         "https://excel.lidani.cn:8990/update.json"
       ],
       "dangerousWindowsUseSkipVerification": true,
-      "pubkey": "RWSluB0KZAX6om4zqhM1UIJcXXW8J61Lnd4ph57HETqlZn15VRsbBeCP"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEzRDg0QTI5OTY4MDU1OTEKUldTUlZZQ1dLVXJZRTQrSXV1UUFzSVY0Nk05RGtsbEtlYm5aaWxKT0x4MVp3NnYvb2ROT2Zhck0K"
     }
   }
 }

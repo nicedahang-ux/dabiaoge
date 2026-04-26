@@ -1192,6 +1192,23 @@ fn init_db() -> Result<rusqlite::Connection, String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // 看板创建失败暂存表（HTML 不丢，可重试 / 导出 / 删除）
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_dashboards (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            html_content TEXT NOT NULL,
+            new_files TEXT NOT NULL DEFAULT '[]',
+            existing_tables TEXT NOT NULL DEFAULT '[]',
+            source TEXT NOT NULL DEFAULT 'ai_html',
+            last_error TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            updated_at TEXT DEFAULT (datetime('now','localtime'))
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(conn)
 }
 
@@ -2922,11 +2939,21 @@ async fn import_excel_to_table(
             }
         }
     } else if ext == "xlsx" || ext == "xls" {
-        let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
-        let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
-        let range = workbook
-            .worksheet_range(&first_sheet)
-            .map_err(|e| e.to_string())?;
+        let range = if ext == "xlsx" {
+            let cursor = remove_cdata_from_xlsx(path)?;
+            let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
+                .map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        };
         let mut rows = range.rows();
         let headers: Vec<String> = rows
             .next()
@@ -3069,11 +3096,21 @@ async fn ingest_full_data(
             .map(|s| sanitize_col(s))
             .collect();
     } else if ext == "xlsx" || ext == "xls" {
-        let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
-        let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
-        let range = workbook
-            .worksheet_range(&first_sheet)
-            .map_err(|e| e.to_string())?;
+        let range = if ext == "xlsx" {
+            let cursor = remove_cdata_from_xlsx(path)?;
+            let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
+                .map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        };
         columns = range
             .rows()
             .next()
@@ -3125,11 +3162,21 @@ async fn ingest_full_data(
             insert_chunk(&conn, &temp_table, &columns, &chunk)?;
         }
     } else {
-        let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
-        let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
-        let range = workbook
-            .worksheet_range(&first_sheet)
-            .map_err(|e| e.to_string())?;
+        let range = if ext == "xlsx" {
+            let cursor = remove_cdata_from_xlsx(path)?;
+            let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
+                .map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        };
         let mut rows = range.rows();
         rows.next(); // skip header
         let mut chunk: Vec<Vec<String>> = vec![];
@@ -3626,6 +3673,87 @@ async fn import_dashboard_pack(file_path: String) -> Result<String, String> {
     Ok(new_dashboard_id)
 }
 
+/// 重新生成指定看板的 table_data：从 source_table 拉取全量数据写入 JSON
+#[tauri::command]
+fn refresh_dashboard_table_data(id: String) -> Result<usize, String> {
+    let conn = init_db()?;
+
+    // 1. 读取看板的 source_table
+    let source_table: String = conn
+        .query_row(
+            "SELECT source_table FROM dashboards WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("看板不存在或无关联数据表: {}", e))?;
+
+    if source_table.is_empty() {
+        return Err("该看板没有关联数据表(source_table)，无法重建数据".to_string());
+    }
+
+    // 2. 查询 source_table 的列名
+    let mut col_stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", source_table))
+        .map_err(|e| format!("读取表结构失败: {}", e))?;
+    let col_rows = col_stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok(name)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut columns: Vec<String> = vec![];
+    for row in col_rows {
+        columns.push(row.map_err(|e| e.to_string())?);
+    }
+
+    if columns.is_empty() {
+        return Err(format!("数据表 '{}' 没有任何列", source_table));
+    }
+
+    // 3. 查询 source_table 全部数据（转成 JSON 数组）
+    let sql = format!("SELECT * FROM \"{}\"", source_table);
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("查询数据失败: {}", e))?;
+    let col_count = columns.len();
+    let rows = stmt
+        .query_map([], |row| {
+            let mut obj = serde_json::Map::new();
+            for i in 0..col_count {
+                let key = &columns[i];
+                let val = match row.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                    rusqlite::types::ValueRef::Integer(n) => serde_json::Value::Number(n.into()),
+                    rusqlite::types::ValueRef::Real(f) => {
+                        serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or(serde_json::Number::from(0)))
+                    }
+                    rusqlite::types::ValueRef::Text(s) => serde_json::Value::String(String::from_utf8_lossy(s).to_string()),
+                    rusqlite::types::ValueRef::Blob(_) => serde_json::Value::String("<BLOB>".to_string()),
+                };
+                obj.insert(key.clone(), val);
+            }
+            Ok(serde_json::Value::Object(obj))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut data: Vec<serde_json::Value> = vec![];
+    for r in rows {
+        data.push(r.map_err(|e| e.to_string())?);
+    }
+
+    let table_data_json = serde_json::to_string(&data).map_err(|e| e.to_string())?;
+    let row_count = data.len();
+
+    // 4. 写回 dashboards.table_data
+    conn.execute(
+        "UPDATE dashboards SET table_data = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        rusqlite::params![&table_data_json, &id],
+    )
+    .map_err(|e| format!("更新看板数据失败: {}", e))?;
+
+    println!("[refresh_dashboard_table_data] 看板 {} 的 table_data 已重建，共 {} 行", id, row_count);
+    Ok(row_count)
+}
+
 #[tauri::command]
 async fn start_bot(app: tauri::AppHandle) -> Result<(), String> {
     bot::start_bot(app).await
@@ -3857,8 +3985,7 @@ fn compress_html_for_ai(html: String) -> Result<String, String> {
     Ok(s)
 }
 
-#[tauri::command]
-async fn create_dashboard_from_template(
+async fn create_dashboard_from_template_inner(
     app: tauri::AppHandle,
     html_content: String,
     new_files: Vec<NewFileSpec>,
@@ -4246,8 +4373,7 @@ fn rollback_created_tables(table_names: Vec<String>) -> Result<(), String> {
 /// - 仍然走 Stage B/C/D 把 new_files 入库（如果有），并写中文备注；
 /// - 跳过 Stage E（AI 不再设计 JSON 看板配置）；
 /// - Stage F 直接用用户给的 html_content 落库，source_table 选第一张新建表，否则第一张 existing_tables。
-#[tauri::command]
-async fn create_dashboard_from_ai_html(
+async fn create_dashboard_from_ai_html_inner(
     app: tauri::AppHandle,
     html_content: String,
     new_files: Vec<NewFileSpec>,
@@ -4530,6 +4656,266 @@ async fn create_dashboard_from_ai_html(
     })
 }
 
+// ========== 看板创建失败暂存 / 重试 / 导出 ==========
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingDashboard {
+    pub id: String,
+    pub name: String,
+    pub html_content: String,
+    pub new_files: Vec<NewFileSpec>,
+    pub existing_tables: Vec<String>,
+    pub source: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn stash_pending_dashboard(
+    id: &str,
+    name: &str,
+    html_content: &str,
+    new_files: &[NewFileSpec],
+    existing_tables: &[String],
+    source: &str,
+    last_error: &str,
+) -> Result<(), String> {
+    let conn = init_db()?;
+    let new_files_json = serde_json::to_string(new_files).unwrap_or_else(|_| "[]".to_string());
+    let existing_json = serde_json::to_string(existing_tables).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO pending_dashboards (id, name, html_content, new_files, existing_tables, source, last_error, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now','localtime'))
+         ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,
+            html_content=excluded.html_content,
+            new_files=excluded.new_files,
+            existing_tables=excluded.existing_tables,
+            source=excluded.source,
+            last_error=excluded.last_error,
+            updated_at=datetime('now','localtime')",
+        rusqlite::params![id, name, html_content, new_files_json, existing_json, source, last_error],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn delete_pending_row(id: &str) -> Result<(), String> {
+    let conn = init_db()?;
+    conn.execute("DELETE FROM pending_dashboards WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn finalize_create_result(
+    app: &tauri::AppHandle,
+    pending_id: &str,
+    name_for_pending: &str,
+    html_content: &str,
+    new_files: &[NewFileSpec],
+    existing_tables: &[String],
+    source: &str,
+    result: Result<CreateDashboardResult, String>,
+) -> Result<CreateDashboardResult, String> {
+    match result {
+        Ok(r) => {
+            let _ = delete_pending_row(pending_id);
+            Ok(r)
+        }
+        Err(e) => {
+            let _ = stash_pending_dashboard(
+                pending_id,
+                name_for_pending,
+                html_content,
+                new_files,
+                existing_tables,
+                source,
+                &e,
+            );
+            emit_create_progress(
+                app,
+                "error",
+                &e,
+                serde_json::json!({
+                    "pending_id": pending_id,
+                    "error": e,
+                }),
+            );
+            Err(format!(
+                "{}\n\n看板已暂存到「待创建看板」，可在看板列表中重试或导出 HTML。",
+                e
+            ))
+        }
+    }
+}
+
+#[tauri::command]
+async fn create_dashboard_from_ai_html(
+    app: tauri::AppHandle,
+    html_content: String,
+    new_files: Vec<NewFileSpec>,
+    existing_tables: Vec<String>,
+    dashboard_name: Option<String>,
+) -> Result<CreateDashboardResult, String> {
+    let pending_id = Uuid::new_v4().to_string();
+    let name_for_pending = dashboard_name
+        .clone()
+        .unwrap_or_else(|| "AI 看板".to_string());
+    let result = create_dashboard_from_ai_html_inner(
+        app.clone(),
+        html_content.clone(),
+        new_files.clone(),
+        existing_tables.clone(),
+        dashboard_name,
+    )
+    .await;
+    finalize_create_result(
+        &app,
+        &pending_id,
+        &name_for_pending,
+        &html_content,
+        &new_files,
+        &existing_tables,
+        "ai_html",
+        result,
+    )
+}
+
+#[tauri::command]
+async fn create_dashboard_from_template(
+    app: tauri::AppHandle,
+    html_content: String,
+    new_files: Vec<NewFileSpec>,
+    existing_tables: Vec<String>,
+    dashboard_name: Option<String>,
+) -> Result<CreateDashboardResult, String> {
+    let pending_id = Uuid::new_v4().to_string();
+    let name_for_pending = dashboard_name
+        .clone()
+        .unwrap_or_else(|| "模板看板".to_string());
+    let result = create_dashboard_from_template_inner(
+        app.clone(),
+        html_content.clone(),
+        new_files.clone(),
+        existing_tables.clone(),
+        dashboard_name,
+    )
+    .await;
+    finalize_create_result(
+        &app,
+        &pending_id,
+        &name_for_pending,
+        &html_content,
+        &new_files,
+        &existing_tables,
+        "template",
+        result,
+    )
+}
+
+#[tauri::command]
+async fn list_pending_dashboards() -> Result<Vec<PendingDashboard>, String> {
+    let conn = init_db()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, html_content, new_files, existing_tables, source, last_error, created_at, updated_at
+             FROM pending_dashboards ORDER BY updated_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let new_files_json: String = row.get(3)?;
+            let existing_json: String = row.get(4)?;
+            Ok(PendingDashboard {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                html_content: row.get(2)?,
+                new_files: serde_json::from_str(&new_files_json).unwrap_or_default(),
+                existing_tables: serde_json::from_str(&existing_json).unwrap_or_default(),
+                source: row.get(5)?,
+                last_error: row.get(6).ok(),
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Ok(p) = r {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn delete_pending_dashboard(id: String) -> Result<(), String> {
+    delete_pending_row(&id)
+}
+
+#[tauri::command]
+async fn retry_pending_dashboard(
+    app: tauri::AppHandle,
+    id: String,
+    new_files: Vec<NewFileSpec>,
+    existing_tables: Vec<String>,
+) -> Result<CreateDashboardResult, String> {
+    let conn = init_db()?;
+    let (name, html_content, source): (String, String, String) = conn
+        .query_row(
+            "SELECT name, html_content, source FROM pending_dashboards WHERE id = ?1",
+            rusqlite::params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| format!("找不到待创建看板: {}", e))?;
+    drop(conn);
+
+    let result = if source == "template" {
+        create_dashboard_from_template_inner(
+            app.clone(),
+            html_content.clone(),
+            new_files.clone(),
+            existing_tables.clone(),
+            Some(name.clone()),
+        )
+        .await
+    } else {
+        create_dashboard_from_ai_html_inner(
+            app.clone(),
+            html_content.clone(),
+            new_files.clone(),
+            existing_tables.clone(),
+            Some(name.clone()),
+        )
+        .await
+    };
+
+    finalize_create_result(
+        &app,
+        &id,
+        &name,
+        &html_content,
+        &new_files,
+        &existing_tables,
+        &source,
+        result,
+    )
+}
+
+#[tauri::command]
+async fn export_pending_html(id: String, save_path: String) -> Result<(), String> {
+    let conn = init_db()?;
+    let html_content: String = conn
+        .query_row(
+            "SELECT html_content FROM pending_dashboards WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("找不到待创建看板: {}", e))?;
+    std::fs::write(&save_path, html_content).map_err(|e| format!("写入文件失败: {}", e))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4537,6 +4923,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--flag1", "--flag2"])))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -4592,12 +4979,17 @@ pub fn run() {
             get_column_remarks,
             set_column_remark,
             get_table_remark,
+            refresh_dashboard_table_data,
             set_table_remark,
             get_table_mappings,
             save_table_mappings,
             compress_html_for_ai,
             create_dashboard_from_template,
             create_dashboard_from_ai_html,
+            list_pending_dashboards,
+            delete_pending_dashboard,
+            retry_pending_dashboard,
+            export_pending_html,
             rollback_created_tables,
             rollback_dashboard,
             log_to_terminal,

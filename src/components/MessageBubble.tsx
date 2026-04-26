@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { User, Bot, CheckCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -27,13 +27,17 @@ export default function MessageBubble({
     setSelectedOptions({});
     setAnswers([]);
   }, [message.id]);
-  const questions =
-    thoughtGuideMode &&
-    message.role === "assistant" &&
-    !isSubmitted &&
-    isLatestAssistant
-      ? parseThoughtQuestions(message.content)
-      : null;
+
+  const questions = useMemo(
+    () =>
+      thoughtGuideMode &&
+      message.role === "assistant" &&
+      !isSubmitted &&
+      isLatestAssistant
+        ? parseThoughtQuestions(message.content)
+        : null,
+    [thoughtGuideMode, message.role, message.content, isSubmitted, isLatestAssistant]
+  );
 
   const hasQuestions = questions && questions.length > 0;
 
@@ -172,29 +176,43 @@ export default function MessageBubble({
                 </p>
                 {uniqueOptions.length > 0 ? (
                   <div className="space-y-1">
-                    {uniqueOptions.map((opt) => (
-                      <label key={opt.key} className="flex items-center gap-2 text-sm cursor-pointer">
-                        <input
-                          type="radio"
-                          name={`q-${q.number}-${idx}`}
-                          checked={selectedOptions[idx] === opt.key}
-                          onChange={() => handleSelectOption(idx, opt.key, opt.text)}
-                          className="accent-amber-600"
-                        />
-                        <span className="text-xs text-amber-900">
-                          {opt.key}. {opt.text}
-                        </span>
-                      </label>
-                    ))}
-                    <label className="flex items-center gap-2 text-sm cursor-pointer">
+                    {uniqueOptions.map((opt) => {
+                      const isSelected = selectedOptions[idx] === opt.key;
+                      return (
+                        <label
+                          key={opt.key}
+                          className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1 py-0.5 transition-colors ${
+                            isSelected ? "bg-amber-200/60 text-amber-800 font-medium" : "text-amber-900"
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name={`q-${q.number}-${idx}`}
+                            value={opt.key}
+                            checked={isSelected}
+                            onChange={() => handleSelectOption(idx, opt.key, opt.text)}
+                            className="accent-amber-600"
+                          />
+                          <span className="text-xs">
+                            {opt.key}. {opt.text}
+                          </span>
+                        </label>
+                      );
+                    })}
+                    <label
+                      className={`flex items-center gap-2 text-sm cursor-pointer rounded px-1 py-0.5 transition-colors ${
+                        selectedOptions[idx] === "other" ? "bg-amber-200/60 text-amber-800 font-medium" : "text-amber-900"
+                      }`}
+                    >
                       <input
                         type="radio"
                         name={`q-${q.number}-${idx}`}
+                        value="other"
                         checked={selectedOptions[idx] === "other"}
                         onChange={() => handleSelectOption(idx, "other", "")}
                         className="accent-amber-600"
                       />
-                      <span className="text-xs text-amber-900">其它</span>
+                      <span className="text-xs">其它</span>
                     </label>
                     {selectedOptions[idx] === "other" && (
                       <textarea

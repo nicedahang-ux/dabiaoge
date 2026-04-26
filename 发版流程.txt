@@ -26,3 +26,14 @@ src-tauri/target/release/bundle/nsis/AI表格转看板_0.1.0_x64-setup.exe
 把生成的 .nsis.zip 放到 update-server/public/
 修改 update-server/public/update-info.json 中的 version 和 url
 用户点击"检查更新"即可自动升级
+
+
+# 1. 构建
+$env:TAURI_SIGNING_PRIVATE_KEY="dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5ClJXUlRZMEl5eE1FMEVmdlR2NTY2bnFNRVUyWGM4MDU2WVErVitGd1Naa0pXT0tNR1hBVUFBQkFBQUFBQUFBQUFBQUlBQUFBQThiYjdKRHFUNVQ1cUZ5bnBkblUrK2JoRURXbC9uRnlXaW9qMlVJdjYxK09jUFoyeUxPcGs3Zk9kRGZlV3hpMDNaemJFVUVLU2Nnek0zVnZQWENvd1JhNmhWN0FBbUhsQVVFZCtRd3BSRG1IMnVEck5qUHQ1OG96TzVQK01WQWM2b3BTSHQzb2JPdjA9Cg=="
+npx tauri build --bundles nsis
+
+# 2. 构建完成后，读取新的签名（每次构建签名都会变，因为含时间戳）
+cat src-tauri/target/release/bundle/nsis/AI表格转看板_0.2.0_x64-setup.nsis.zip.sig
+
+# 3. 把签名内容填到 update-server/public/update-info.json 的 signature 字段
+# 4. 把 nsis.zip 和更新后的 update-info.json 一起上传服务器，重启服务

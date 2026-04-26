@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
-import { Loader2, Bot, Clock, CheckCircle2, Circle, Zap, FileSpreadsheet, X, Database, AlertTriangle } from "lucide-react";
+import { Loader2, Bot, Clock, CheckCircle2, Circle, Zap, FileSpreadsheet, X, Database, AlertTriangle, ChevronDown, ChevronUp } from "lucide-react";
 import InputArea, { type Attachment } from "@/components/InputArea";
 import MessageBubble from "@/components/MessageBubble";
 import ExecutionTracker from "@/components/ExecutionTracker";
@@ -58,7 +58,7 @@ export default function AIChat({
   dashboardTag,
   onClearDashboardTag,
 }: AIChatProps) {
-  const { sessions, refreshSessions, refreshDashboards, switchView, setBoardsSelectedId } = useApp();
+  const { sessions, refreshSessions, refreshDashboards, refreshPendingDashboards, switchView, setBoardsSelectedId } = useApp();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -77,9 +77,11 @@ export default function AIChat({
   const scrollRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const messageRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const tableDropdownRef = useRef<HTMLDivElement>(null);
   const [nodePositions, setNodePositions] = useState<{ id: string; top: number; preview: string }[]>([]);
   const [dbSelectOpen, setDbSelectOpen] = useState(false);
   const [dbTablePreviews, setDbTablePreviews] = useState<DbTablePreview[]>([]);
+  const [tableDropdownOpen, setTableDropdownOpen] = useState(false);
   const [duplicateModal, setDuplicateModal] = useState<{
     open: boolean;
     tableName: string;
@@ -178,6 +180,18 @@ export default function AIChat({
     if (el) ro.observe(el);
     return () => ro.disconnect();
   }, [messages]);
+
+  // 点击外部关闭表格下拉弹窗
+  useEffect(() => {
+    if (!tableDropdownOpen) return;
+    const onClick = (e: MouseEvent) => {
+      if (tableDropdownRef.current && !tableDropdownRef.current.contains(e.target as Node)) {
+        setTableDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [tableDropdownOpen]);
 
   useEffect(() => {
     if (currentSession) {
@@ -355,10 +369,15 @@ export default function AIChat({
   const handleClearTable = () => {
     setFilePreviews([]);
     setFilePaths([]);
+    setTableDropdownOpen(false);
   };
 
   const handleRemoveTable = (index: number) => {
-    setFilePreviews((prev) => prev.filter((_, i) => i !== index));
+    setFilePreviews((prev) => {
+      const next = prev.filter((_, i) => i !== index);
+      if (next.length === 0) setTableDropdownOpen(false);
+      return next;
+    });
     setFilePaths((prev) => prev.filter((_, i) => i !== index));
   };
 
@@ -782,6 +801,7 @@ export default function AIChat({
         } catch (e) {
           setModifyingState({ status: "error", error: String(e) });
           toast.error(String(e));
+          refreshPendingDashboards();
         } finally {
           setHtmlBuildActive(false);
         }
@@ -890,34 +910,61 @@ export default function AIChat({
             <Database className="h-3.5 w-3.5 text-blue-600" />
             {dbTablePreviews.length > 0 ? "更换数据库" : "选择数据库"}
           </button>
-          {filePreviews.map((preview, idx) => (
-            <span
-              key={idx}
-              className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium"
-            >
-              <FileSpreadsheet className="h-3 w-3" />
-              <span className="max-w-[260px] truncate">
-                {filePaths[idx] ? filePaths[idx].split(/[\\/]/).pop() : preview.sheet_name}
-              </span>
-              <span className="text-emerald-600/80">
-                · {preview.columns.length}列 / 预览{preview.preview_data.length}行
-              </span>
-              <button
-                onClick={() => handleRemoveTable(idx)}
-                className="ml-1 hover:text-emerald-900"
-                title="移除"
-              >
-                <X className="h-3 w-3" />
-              </button>
-            </span>
-          ))}
+          {/* 已加载表格下拉弹窗 */}
           {filePreviews.length > 0 && (
-            <button
-              onClick={handleClearTable}
-              className="text-xs text-slate-500 hover:text-slate-700 underline"
-            >
-              清除全部
-            </button>
+            <div className="relative" ref={tableDropdownRef}>
+              <button
+                onClick={() => setTableDropdownOpen((v) => !v)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md border bg-white text-xs hover:bg-slate-50"
+              >
+                <FileSpreadsheet className="h-3.5 w-3.5 text-emerald-600" />
+                <span className="text-slate-700">
+                  已加载 {filePreviews.length} 张表格
+                </span>
+                {tableDropdownOpen ? (
+                  <ChevronUp className="h-3 w-3 text-slate-500" />
+                ) : (
+                  <ChevronDown className="h-3 w-3 text-slate-500" />
+                )}
+              </button>
+
+              {tableDropdownOpen && (
+                <div className="absolute left-0 top-full mt-1 z-50 w-80 max-h-72 overflow-y-auto rounded-lg border bg-white shadow-lg p-2 space-y-1">
+                  <div className="flex items-center justify-between px-1 pb-1 border-b">
+                    <span className="text-xs font-medium text-slate-600">已加载表格列表</span>
+                    <button
+                      onClick={handleClearTable}
+                      className="text-[10px] text-slate-500 hover:text-red-600 underline"
+                    >
+                      清除全部
+                    </button>
+                  </div>
+                  {filePreviews.map((preview, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center gap-2 px-2 py-1.5 rounded bg-emerald-50 text-emerald-800 text-xs"
+                    >
+                      <FileSpreadsheet className="h-3.5 w-3.5 flex-shrink-0 text-emerald-600" />
+                      <div className="flex-1 min-w-0">
+                        <div className="truncate font-medium">
+                          {filePaths[idx] ? filePaths[idx].split(/[\\/]/).pop() : preview.sheet_name}
+                        </div>
+                        <div className="text-[10px] text-emerald-600/80">
+                          {preview.columns.length} 列 · 预览 {preview.preview_data.length} 行
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleRemoveTable(idx)}
+                        className="flex-shrink-0 p-0.5 rounded hover:bg-emerald-200 text-emerald-700"
+                        title="移除"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
           {dbTablePreviews.length > 0 && (
             <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-blue-100 text-blue-700 text-xs font-medium">

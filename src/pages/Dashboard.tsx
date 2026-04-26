@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import ReactECharts from "echarts-for-react";
 import { toPng } from "html-to-image";
 import * as XLSX from "xlsx";
@@ -49,7 +50,10 @@ import {
 import DashboardCard from "@/components/DashboardCard";
 import SqlRepairTracker from "@/components/SqlRepairTracker";
 import CreateDashboardModal from "@/components/CreateDashboardModal";
-import { useApp, type Dashboard } from "@/lib/AppContext";
+import PendingDashboardCard from "@/components/PendingDashboardCard";
+import RetryPendingModal from "@/components/RetryPendingModal";
+import AiHtmlBuildOverlay from "@/components/AiHtmlBuildOverlay";
+import { useApp, type Dashboard, type PendingDashboard, type NewFileSpec } from "@/lib/AppContext";
 import { formatBeijingTime } from "@/lib/utils";
 import { estimateTokens } from "@/lib/thoughtGuideQuestions";
 import {
@@ -103,6 +107,8 @@ export default function DashboardPage() {
   const {
     dashboards,
     refreshDashboards,
+    pendingDashboards,
+    refreshPendingDashboards,
     switchView,
     setCurrentSessionId,
     setCurrentDashboardId,
@@ -123,7 +129,10 @@ export default function DashboardPage() {
   const [repairActive, setRepairActive] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [deletingDashboard, setDeletingDashboard] = useState<Dashboard | null>(null);
+  const [refreshingTableData, setRefreshingTableData] = useState(false);
   const [deleteMode, setDeleteMode] = useState<"dashboard" | "with_table">("dashboard");
+  const [retryPending, setRetryPending] = useState<PendingDashboard | null>(null);
+  const [retryActive, setRetryActive] = useState(false);
   const [htmlSrcDoc, setHtmlSrcDoc] = useState<string | null>(null);
   const [htmlLoading, setHtmlLoading] = useState(false);
   const [cacheVersion, setCacheVersion] = useState(0);
@@ -230,7 +239,8 @@ export default function DashboardPage() {
 
   useEffect(() => {
     refreshDashboards();
-  }, [refreshDashboards]);
+    refreshPendingDashboards();
+  }, [refreshDashboards, refreshPendingDashboards]);
 
   // 初始化筛选器默认值
   useEffect(() => {
@@ -671,6 +681,53 @@ export default function DashboardPage() {
     }
   };
 
+  const handleRetryPending = (p: PendingDashboard) => {
+    setRetryPending(p);
+  };
+
+  const handleConfirmRetry = async (newFiles: NewFileSpec[], existingTables: string[]) => {
+    if (!retryPending) return;
+    const id = retryPending.id;
+    setRetryPending(null);
+    setRetryActive(true);
+    try {
+      await invoke("retry_pending_dashboard", { id, newFiles, existingTables });
+      toast.success("看板创建成功");
+      await refreshDashboards();
+      await refreshPendingDashboards();
+    } catch (e) {
+      toast.error(String(e));
+      await refreshPendingDashboards();
+    } finally {
+      setRetryActive(false);
+    }
+  };
+
+  const handleExportPendingHtml = async (p: PendingDashboard) => {
+    try {
+      const path = await saveDialog({
+        defaultPath: `${p.name || "dashboard"}.html`,
+        filters: [{ name: "HTML", extensions: ["html"] }],
+      });
+      if (!path) return;
+      await invoke("export_pending_html", { id: p.id, savePath: path });
+      toast.success("HTML 已导出");
+    } catch (e) {
+      toast.error("导出失败: " + String(e));
+    }
+  };
+
+  const handleDeletePending = async (p: PendingDashboard) => {
+    if (!window.confirm(`确认删除待创建看板「${p.name}」？此操作不可撤销。`)) return;
+    try {
+      await invoke("delete_pending_dashboard", { id: p.id });
+      toast.success("已删除");
+      await refreshPendingDashboards();
+    } catch (e) {
+      toast.error("删除失败: " + String(e));
+    }
+  };
+
   return (
     <div className="flex flex-col h-full overflow-auto"
     >
@@ -703,6 +760,29 @@ export default function DashboardPage() {
           </div>
         </div
         >
+
+        {/* Pending Dashboards (失败暂存) */}
+        {!selectedDashboard && pendingDashboards.length > 0 && (
+          <div className="space-y-2">
+            <h2 className="text-sm font-semibold text-amber-700">
+              待创建看板（{pendingDashboards.length}）
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {pendingDashboards.map((p) => (
+                <PendingDashboardCard
+                  key={p.id}
+                  pending={p}
+                  onRetry={handleRetryPending}
+                  onExport={handleExportPendingHtml}
+                  onDelete={handleDeletePending}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 重试进度 */}
+        {retryActive && <AiHtmlBuildOverlay isActive={retryActive} mode="create" />}
 
         {/* Empty State */}
         {dashboards.length === 0 && (
@@ -814,6 +894,28 @@ export default function DashboardPage() {
                 >
                   <Camera className="h-3.5 w-3.5" />
                   截图反馈
+                </button
+                >
+                <button
+                  onClick={async () => {
+                    if (!selectedDashboard) return;
+                    setRefreshingTableData(true);
+                    try {
+                      const rowCount = await invoke<number>("refresh_dashboard_table_data", { id: selectedDashboard.id });
+                      toast.success(`看板「${selectedDashboard.name}」的 AI 数据已重建，共 ${rowCount} 行`);
+                      // 刷新看板列表，让 table_data 更新到本地状态
+                      await refreshDashboards();
+                    } catch (e: any) {
+                      toast.error(e?.toString?.() || "重建数据失败");
+                    } finally {
+                      setRefreshingTableData(false);
+                    }
+                  }}
+                  disabled={refreshingTableData || !selectedDashboard.source_table}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md text-xs hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {refreshingTableData ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Database className="h-3.5 w-3.5" />}
+                  重建AI数据
                 </button
                 >
                 <button
@@ -1143,6 +1245,13 @@ export default function DashboardPage() {
           setBoardsSelectedId(id);
           refreshDashboards();
         }}
+      />
+
+      <RetryPendingModal
+        open={!!retryPending}
+        pending={retryPending}
+        onClose={() => setRetryPending(null)}
+        onConfirm={handleConfirmRetry}
       />
 
       {/* 删除看板确认弹窗 */}

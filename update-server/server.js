@@ -59,7 +59,8 @@ app.get('/download/:filename', (req, res) => {
     return res.status(404).json({ error: '文件不存在', filename });
   }
 
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  const encodedFilename = encodeURIComponent(filename);
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodedFilename}`);
   res.setHeader('Content-Type', 'application/octet-stream');
   fs.createReadStream(filePath).pipe(res);
 });
