@@ -1,14 +1,13 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { Loader2, Settings as SettingsIcon, MessageSquare, Bot, Power, MonitorUp } from "lucide-react";
 import { toast } from "sonner";
 import { isEnabled, enable, disable } from "@tauri-apps/plugin-autostart";
+import { useApp } from "@/lib/AppContext";
 
 interface AppConfig {
   ai_url: string;
@@ -27,35 +26,19 @@ const defaultConfig: AppConfig = {
 };
 
 export default function Settings() {
+  const { botStatus, refreshBotStatus } = useApp();
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const [botStatus, setBotStatus] = useState<"connected" | "disconnected">("disconnected");
   const [botLoading, setBotLoading] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
 
   useEffect(() => {
     loadConfig();
     loadAutoStart();
-    invoke("get_bot_status")
-      .then((res: any) => {
-        setBotStatus(res.status === "connected" ? "connected" : "disconnected");
-      })
-      .catch(() => {});
-    const unlistenStatus = listen("bot-status-change", (event) => {
-      const payload = event.payload as { status: string };
-      setBotStatus(payload.status === "connected" ? "connected" : "disconnected");
-    });
-    const unlistenError = listen("bot-send-error", (event) => {
-      const payload = event.payload as { error: string };
-      toast.error("机器人发送消息失败", { description: payload.error });
-    });
-    return () => {
-      unlistenStatus.then((f) => f());
-      unlistenError.then((f) => f());
-    };
-  }, []);
+    refreshBotStatus().catch(() => {});
+  }, [refreshBotStatus]);
 
   async function loadAutoStart() {
     try {
@@ -206,6 +189,7 @@ export default function Settings() {
               try {
                 await invoke("start_bot");
                 toast.success("机器人启动成功，钉钉服务已连接");
+                await refreshBotStatus();
               } catch (e) {
                 const msg = String(e);
                 if (msg.includes("Stream") || msg.includes("gateway") || msg.includes("endpoint") || msg.includes("WebSocket")) {
@@ -225,10 +209,10 @@ export default function Settings() {
                 setBotLoading(false);
               }
             }}
-            disabled={botLoading}
+            disabled={botLoading || botStatus === "connected"}
           >
             {botLoading && <Loader2 className="mr-2 h-3 w-3 animate-spin" />}
-            <Power className="h-3 w-3 mr-1" /> 启动
+            <Power className="h-3 w-3 mr-1" /> {botStatus === "connected" ? "已启动" : "启动"}
           </Button>
         </div>
       </div>
@@ -321,11 +305,17 @@ export default function Settings() {
               <Label htmlFor="auto-start">开机自启</Label>
               <p className="text-xs text-slate-500">系统登录时自动启动本应用</p>
             </div>
-            <Switch
+            <button
               id="auto-start"
-              checked={autoStart}
-              onCheckedChange={handleAutoStartChange}
-            />
+              onClick={() => handleAutoStartChange(!autoStart)}
+              className={`px-4 py-1.5 rounded-md text-sm text-white font-medium transition-colors ${
+                autoStart
+                  ? "bg-green-500 hover:bg-green-600"
+                  : "bg-red-500 hover:bg-red-600"
+              }`}
+            >
+              {autoStart ? "已开启" : "已关闭"}
+            </button>
           </div>
         </CardContent>
       </Card>

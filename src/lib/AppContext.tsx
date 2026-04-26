@@ -1,6 +1,12 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
 
 export type ViewType = "settings" | "workbench" | "boards" | "database";
+
+export interface Attachment {
+  filename: string;
+  mimeType: string;
+  data: string;
+}
 
 export interface ChatMessage {
   id: string;
@@ -8,6 +14,7 @@ export interface ChatMessage {
   content: string;
   timestamp?: string;
   durationMs?: number;
+  attachments?: Attachment[];
 }
 
 export interface Session {
@@ -30,6 +37,9 @@ export interface Dashboard {
   charts?: string;
   table_data?: string;
   source_table?: string;
+  actions?: string;
+  summary_cards?: string;
+  html_content?: string;
   created_at: string;
   updated_at: string;
 }
@@ -42,6 +52,7 @@ interface AppState {
   currentDashboardId: string | null;
   boardsSelectedId: string | null;
   workbenchDashboardTag: string | undefined;
+  botStatus: "connected" | "disconnected";
   switchView: (view: ViewType) => void;
   setSessions: (sessions: Session[]) => void;
   setCurrentSessionId: (id: string | null) => void;
@@ -51,6 +62,7 @@ interface AppState {
   setWorkbenchDashboardTag: (tag: string | undefined) => void;
   refreshSessions: () => Promise<void>;
   refreshDashboards: () => Promise<void>;
+  refreshBotStatus: () => Promise<void>;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -63,6 +75,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [currentDashboardId, setCurrentDashboardId] = useState<string | null>(null);
   const [boardsSelectedId, setBoardsSelectedId] = useState<string | null>(null);
   const [workbenchDashboardTag, setWorkbenchDashboardTag] = useState<string | undefined>(undefined);
+  const [botStatus, setBotStatus] = useState<"connected" | "disconnected">("disconnected");
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -84,6 +97,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const refreshBotStatus = useCallback(async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const res: any = await invoke("get_bot_status");
+      setBotStatus(res.status === "connected" ? "connected" : "disconnected");
+    } catch {
+      setBotStatus("disconnected");
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshBotStatus();
+    let unlisten: (() => void) | undefined;
+    const setup = async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen("bot-status-change", (event) => {
+        const payload = event.payload as { status: string };
+        setBotStatus(payload.status === "connected" ? "connected" : "disconnected");
+      });
+    };
+    setup();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [refreshBotStatus]);
+
   const switchView = useCallback((view: ViewType) => {
     setActiveView(view);
   }, []);
@@ -98,6 +137,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         currentDashboardId,
         boardsSelectedId,
         workbenchDashboardTag,
+        botStatus,
         switchView,
         setSessions,
         setCurrentSessionId,
@@ -107,6 +147,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setWorkbenchDashboardTag,
         refreshSessions,
         refreshDashboards,
+        refreshBotStatus,
       }}
     >
       {children}

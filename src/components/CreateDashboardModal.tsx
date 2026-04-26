@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Dialog,
   DialogContent,
@@ -12,6 +13,11 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   Table,
   TableBody,
@@ -29,6 +35,9 @@ import {
   AlertTriangle,
   Loader2,
   Trash2,
+  Search,
+  ChevronDown,
+  Check,
 } from "lucide-react";
 import { toast } from "sonner";
 import CreateDashboardTracker from "./CreateDashboardTracker";
@@ -58,11 +67,19 @@ interface CreateDashboardResult {
 }
 
 interface FileEntry {
-  file: File;
+  fileName: string;
   path: string;
   targetTable: string;
   preview: ParseResult | null;
   loading: boolean;
+}
+
+interface ChatTableInfo {
+  table_name: string;
+  remark: string;
+  dashboards: string[];
+  column_count: number;
+  row_count: number;
 }
 
 function sanitizeTableName(name: string): string {
@@ -88,8 +105,10 @@ export default function CreateDashboardModal({
   const [htmlContent, setHtmlContent] = useState("");
   const [htmlFileName, setHtmlFileName] = useState("");
   const [newFiles, setNewFiles] = useState<FileEntry[]>([]);
-  const [existingTables, setExistingTables] = useState<string[]>([]);
+  const [existingTables, setExistingTables] = useState<ChatTableInfo[]>([]);
   const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set());
+  const [tableSelectOpen, setTableSelectOpen] = useState(false);
+  const [tableSearch, setTableSearch] = useState("");
   const [dashboardName, setDashboardName] = useState("");
   const [trackerActive, setTrackerActive] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -100,7 +119,7 @@ export default function CreateDashboardModal({
   // 加载已有表
   useEffect(() => {
     if (open && step === 1) {
-      invoke<string[]>("get_db_tables")
+      invoke<ChatTableInfo[]>("list_db_tables_for_chat")
         .then((tables) => setExistingTables(tables))
         .catch(() => setExistingTables([]));
     }
@@ -151,60 +170,49 @@ export default function CreateDashboardModal({
     multiple: false,
   });
 
-  // Data file dropzone
-  const onDropData = useCallback((acceptedFiles: File[]) => {
-    for (const file of acceptedFiles) {
-      const ext = file.name.split(".").pop()?.toLowerCase();
-      if (!["xlsx", "xls", "csv"].includes(ext || "")) continue;
-      // @ts-expect-error electron/tauri specific path property
-      const path = file?.path as string | undefined;
-      if (!path) {
-        toast.error(`无法获取文件路径: ${file.name}`);
-        continue;
+  // 选择数据文件（使用 Tauri 对话框获取真实路径）
+  const handleSelectDataFiles = async () => {
+    try {
+      const selected = await openDialog({
+        multiple: true,
+        filters: [
+          { name: "表格文件", extensions: ["xlsx", "xls", "csv"] },
+        ],
+      });
+      if (!selected || !Array.isArray(selected)) return;
+      for (const path of selected) {
+        if (typeof path !== "string") continue;
+        const fileName = path.split(/[\\/]/).pop() || path;
+        const entry: FileEntry = {
+          fileName,
+          path,
+          targetTable: sanitizeTableName(fileName),
+          preview: null,
+          loading: true,
+        };
+        setNewFiles((prev) => [...prev, entry]);
+        // 解析预览
+        invoke<ParseResult>("parse_excel", { path })
+          .then((res) => {
+            setNewFiles((prev) =>
+              prev.map((f) =>
+                f.path === path ? { ...f, preview: res, loading: false } : f
+              )
+            );
+          })
+          .catch((e) => {
+            toast.error(`${fileName} 预览失败: ${String(e)}`);
+            setNewFiles((prev) =>
+              prev.map((f) =>
+                f.path === path ? { ...f, loading: false } : f
+              )
+            );
+          });
       }
-      const entry: FileEntry = {
-        file,
-        path,
-        targetTable: sanitizeTableName(file.name),
-        preview: null,
-        loading: true,
-      };
-      setNewFiles((prev) => [...prev, entry]);
-      // 解析预览
-      invoke<ParseResult>("parse_excel", { path })
-        .then((res) => {
-          setNewFiles((prev) =>
-            prev.map((f) =>
-              f.path === path ? { ...f, preview: res, loading: false } : f
-            )
-          );
-        })
-        .catch((e) => {
-          toast.error(`${file.name} 预览失败: ${String(e)}`);
-          setNewFiles((prev) =>
-            prev.map((f) =>
-              f.path === path ? { ...f, loading: false } : f
-            )
-          );
-        });
+    } catch (e) {
+      toast.error("选择文件失败: " + String(e));
     }
-  }, []);
-
-  const {
-    getRootProps: getDataRootProps,
-    getInputProps: getDataInputProps,
-    isDragActive: isDataDragActive,
-  } = useDropzone({
-    onDrop: onDropData,
-    accept: {
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [
-        ".xlsx",
-      ],
-      "application/vnd.ms-excel": [".xls"],
-      "text/csv": [".csv"],
-    },
-    multiple: true,
-  });
+  };
 
   const removeNewFile = (path: string) => {
     setNewFiles((prev) => prev.filter((f) => f.path !== path));
@@ -238,7 +246,7 @@ export default function CreateDashboardModal({
     try {
       const spec: NewFileSpec[] = newFiles.map((f) => ({
         file_path: f.path,
-        target_table_name: f.targetTable || sanitizeTableName(f.file.name),
+        target_table_name: f.targetTable || sanitizeTableName(f.fileName),
       }));
       const res = await invoke<CreateDashboardResult>(
         "create_dashboard_from_template",
@@ -270,7 +278,7 @@ export default function CreateDashboardModal({
   const handleRollback = async () => {
     const toDrop = createdTablesOnError.length > 0
       ? createdTablesOnError
-      : newFiles.map((f) => f.targetTable || sanitizeTableName(f.file.name));
+      : newFiles.map((f) => f.targetTable || sanitizeTableName(f.fileName));
     if (toDrop.length === 0) return;
     try {
       await invoke("rollback_created_tables", { tableNames: toDrop });
@@ -363,22 +371,17 @@ export default function CreateDashboardModal({
                   </TabsList>
 
                   <TabsContent value="new" className="space-y-3">
-                    <div
-                      {...getDataRootProps()}
-                      className={`relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed transition-colors cursor-pointer min-h-[100px] ${
-                        isDataDragActive
-                          ? "border-blue-400 bg-blue-50"
-                          : "border-gray-300 bg-white hover:bg-gray-50"
-                      }`}
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="w-full h-[100px] flex flex-col items-center justify-center gap-2 border-dashed"
+                      onClick={handleSelectDataFiles}
                     >
-                      <input {...getDataInputProps()} />
-                      <div className="flex flex-col items-center gap-2 p-4">
-                        <UploadCloud className="h-6 w-6 text-slate-400" />
-                        <p className="text-sm text-slate-600">
-                          拖拽或点击上传 Excel / CSV
-                        </p>
-                      </div>
-                    </div>
+                      <UploadCloud className="h-6 w-6 text-slate-400" />
+                      <span className="text-sm text-slate-600">
+                        点击选择 Excel / CSV 文件
+                      </span>
+                    </Button>
 
                     {newFiles.map((f) => (
                       <div
@@ -388,7 +391,7 @@ export default function CreateDashboardModal({
                         <div className="flex items-center gap-2">
                           <FileSpreadsheet className="h-4 w-4 text-green-600" />
                           <span className="text-sm flex-1 truncate">
-                            {f.file.name}
+                            {f.fileName}
                           </span>
                           <button
                             onClick={() => removeNewFile(f.path)}
@@ -452,22 +455,76 @@ export default function CreateDashboardModal({
                     {existingTables.length === 0 ? (
                       <p className="text-sm text-slate-500">暂无已有数据表</p>
                     ) : (
-                      <div className="grid grid-cols-2 gap-2">
-                        {existingTables.map((t) => (
-                          <label
-                            key={t}
-                            className="flex items-center gap-2 rounded-lg border p-2 cursor-pointer hover:bg-slate-50"
+                      <Popover open={tableSelectOpen} onOpenChange={setTableSelectOpen}>
+                        <PopoverTrigger>
+                          <Button
+                            variant="outline"
+                            className="w-full justify-between"
+                            type="button"
                           >
-                            <input
-                              type="checkbox"
-                              checked={selectedTables.has(t)}
-                              onChange={() => toggleExistingTable(t)}
-                              className="h-4 w-4"
-                            />
-                            <span className="text-sm">{t}</span>
-                          </label>
-                        ))}
-                      </div>
+                            <span className="truncate">
+                              {selectedTables.size === 0
+                                ? "请选择数据表..."
+                                : `已选 ${selectedTables.size} 张表`}
+                            </span>
+                            <ChevronDown className="h-4 w-4 text-slate-400" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-[360px] p-0 bg-white" align="start">
+                          <div className="p-2 border-b">
+                            <div className="relative">
+                              <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
+                              <Input
+                                placeholder="搜索表名..."
+                                className="pl-7 h-8 text-sm"
+                                value={tableSearch}
+                                onChange={(e) => setTableSearch(e.target.value)}
+                              />
+                            </div>
+                          </div>
+                          <ScrollArea className="h-[240px]">
+                            <div className="p-1">
+                              {existingTables
+                                .filter((t) =>
+                                  t.table_name
+                                    .toLowerCase()
+                                    .includes(tableSearch.toLowerCase()) ||
+                                  t.remark
+                                    .toLowerCase()
+                                    .includes(tableSearch.toLowerCase())
+                                )
+                                .map((t) => (
+                                  <div
+                                    key={t.table_name}
+                                    className="flex items-start gap-2 rounded px-2 py-1.5 cursor-pointer hover:bg-slate-50"
+                                    onClick={() => toggleExistingTable(t.table_name)}
+                                  >
+                                    <div className="mt-0.5">
+                                      {selectedTables.has(t.table_name) ? (
+                                        <Check className="h-4 w-4 text-blue-600" />
+                                      ) : (
+                                        <div className="h-4 w-4 rounded border border-slate-300" />
+                                      )}
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                      <div className="text-sm font-medium truncate">
+                                        {t.table_name}
+                                      </div>
+                                      {t.remark && (
+                                        <div className="text-xs text-slate-500 truncate">
+                                          {t.remark}
+                                        </div>
+                                      )}
+                                      <div className="text-[10px] text-slate-400">
+                                        {t.column_count} 列 / {t.row_count} 行
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                            </div>
+                          </ScrollArea>
+                        </PopoverContent>
+                      </Popover>
                     )}
                   </TabsContent>
                 </Tabs>

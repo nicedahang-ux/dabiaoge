@@ -623,6 +623,7 @@ fn sync_dingtalk_to_session(
                 content: content.to_string(),
                 timestamp: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
                 duration_ms: None,
+                attachments: None,
             })
         })
         .collect();

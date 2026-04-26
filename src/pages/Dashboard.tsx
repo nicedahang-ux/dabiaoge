@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ReactECharts from "echarts-for-react";
 import { toPng } from "html-to-image";
@@ -15,6 +15,7 @@ import {
   Database,
   Loader2,
   Plus,
+  Download,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -33,10 +34,21 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import DashboardCard from "@/components/DashboardCard";
 import SqlRepairTracker from "@/components/SqlRepairTracker";
 import CreateDashboardModal from "@/components/CreateDashboardModal";
 import { useApp, type Dashboard } from "@/lib/AppContext";
+import { formatBeijingTime } from "@/lib/utils";
+import { estimateTokens } from "@/lib/thoughtGuideQuestions";
 
 interface ChartData {
   name: string;
@@ -101,11 +113,61 @@ export default function DashboardPage() {
   const [editNameValue, setEditNameValue] = useState("");
   const [repairActive, setRepairActive] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [deletingDashboard, setDeletingDashboard] = useState<Dashboard | null>(null);
+  const [deleteMode, setDeleteMode] = useState<"dashboard" | "with_table">("dashboard");
+  const [htmlSrcDoc, setHtmlSrcDoc] = useState<string | null>(null);
+  const [htmlLoading, setHtmlLoading] = useState(false);
+  const htmlCacheRef = useRef<Map<string, string>>(new Map());
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const dashboardDetailRef = useRef<HTMLDivElement>(null);
+
+  // 动态调整 iframe 高度，消除滚动条
+  const adjustIframeHeight = useCallback(() => {
+    const iframe = iframeRef.current;
+    if (iframe && iframe.contentDocument && iframe.contentDocument.body) {
+      const height = iframe.contentDocument.body.scrollHeight;
+      iframe.style.height = `${height + 40}px`;
+    }
+  }, []);
 
   const selectedDashboard = boardsSelectedId
     ? dashboards.find((d) => d.id === boardsSelectedId) || null
     : null;
+
+  // HTML 看板数据注入：后端直接渲染带数据的 HTML，减少 IPC 和数据处理开销
+  useEffect(() => {
+    async function injectHtmlData() {
+      if (!selectedDashboard?.html_content || !selectedDashboard?.source_table) {
+        setHtmlSrcDoc(selectedDashboard?.html_content || null);
+        return;
+      }
+      const cacheKey = selectedDashboard.id;
+      if (htmlCacheRef.current.has(cacheKey)) {
+        setHtmlSrcDoc(htmlCacheRef.current.get(cacheKey)!);
+        return;
+      }
+      setHtmlLoading(true);
+      try {
+        const html = await invoke<string>("render_html_dashboard", {
+          dashboardId: selectedDashboard.id,
+        });
+        htmlCacheRef.current.set(cacheKey, html);
+        setHtmlSrcDoc(html);
+      } catch (e) {
+        console.error("HTML 渲染失败:", e);
+        let html = selectedDashboard.html_content;
+        const hideCss = `<style>
+          .container > .card:first-of-type { display: none !important; }
+        </style>`;
+        html = html.replace('</head>', hideCss + '</head>');
+        htmlCacheRef.current.set(cacheKey, html);
+        setHtmlSrcDoc(html);
+      } finally {
+        setHtmlLoading(false);
+      }
+    }
+    injectHtmlData();
+  }, [selectedDashboard?.id, selectedDashboard?.html_content, selectedDashboard?.source_table]);
 
   useEffect(() => {
     refreshDashboards();
@@ -202,11 +264,25 @@ export default function DashboardPage() {
                 refreshDashboards();
               }
             } else {
-              toast.error("AI 自动纠错失败,请检查 SQL");
+              toast.error("AI 自动纠错失败,正在回退到提问前状态...");
+              try {
+                await invoke("rollback_dashboard", { id: selectedDashboard.id });
+                toast.success("已回退到上一版看板");
+                refreshDashboards();
+              } catch (rbErr) {
+                toast.error("回退失败: " + String(rbErr));
+              }
             }
           } catch (repairErr) {
             console.error("自动纠错失败:", repairErr);
             toast.error("看板数据查询失败: " + String(repairErr));
+            try {
+              await invoke("rollback_dashboard", { id: selectedDashboard.id });
+              toast.success("已回退到上一版看板");
+              refreshDashboards();
+            } catch (rbErr) {
+              // ignore rollback error here
+            }
           } finally {
             setDashboardLoading(false);
           }
@@ -274,19 +350,43 @@ export default function DashboardPage() {
   const handleScreenshot = async () => {
     if (!dashboardDetailRef.current || !selectedDashboard) return;
     try {
-      await toPng(dashboardDetailRef.current, {
+      const dataUrl = await toPng(dashboardDetailRef.current, {
         backgroundColor: "#ffffff",
         pixelRatio: 2,
       });
+      if (!dataUrl) {
+        toast.error("截图生成失败，未获取到图片数据");
+        return;
+      }
+      const base64 = dataUrl.split(",")[1];
       const id = await invoke<string>("create_session", {
         title: `截图反馈: ${selectedDashboard.name}`,
         thoughtGuideMode: true,
         dashboardId: selectedDashboard.id,
       });
+      // 将截图作为用户消息写入会话，让 AI 能看到
+      const imageMsg = {
+        id: `user-${Date.now()}`,
+        role: "user" as const,
+        content: `这是我看板「${selectedDashboard.name}」的截图，请帮我分析问题并给出改进建议。`,
+        timestamp: formatBeijingTime(new Date()),
+        attachments: [
+          {
+            filename: "screenshot.png",
+            mimeType: "image/png",
+            data: base64,
+          },
+        ],
+      };
+      await invoke("update_session", {
+        sessionId: id,
+        messages: [imageMsg],
+        tokenCount: estimateTokens(imageMsg.content),
+      });
       setCurrentSessionId(id);
       setCurrentDashboardId(selectedDashboard.id);
       switchView("workbench");
-      toast.success("截图已保存到会话");
+      toast.success("截图已保存到会话并发送给 AI");
     } catch (e) {
       toast.error("截图失败: " + String(e));
     }
@@ -340,8 +440,27 @@ export default function DashboardPage() {
     series: [{ data: chartData.map((d) => d.value), type: "bar" }],
   };
 
-  let parsedFilters: { id: string; label: string; type: string }[] = [];
+  const lineOption = {
+    title: { text: "趋势图", left: "center" },
+    tooltip: { trigger: "axis" },
+    xAxis: { type: "category", data: chartData.map((d) => d.name) },
+    yAxis: { type: "value" },
+    series: [{ data: chartData.map((d) => d.value), type: "line", smooth: true }],
+  };
+
+  interface FilterDef {
+    id: string;
+    label: string;
+    type: string;
+    options?: string[];
+    default?: string;
+    target?: string[];
+  }
+
+  let parsedFilters: FilterDef[] = [];
   let parsedCharts: string[] = [];
+  let parsedActions: string[] = [];
+  let parsedSummaryCards: { title: string; field: string; agg: string }[] = [];
   if (selectedDashboard) {
     try {
       parsedFilters = selectedDashboard.ui_filters
@@ -350,10 +469,68 @@ export default function DashboardPage() {
       parsedCharts = selectedDashboard.charts
         ? JSON.parse(selectedDashboard.charts)
         : [];
+      parsedActions = selectedDashboard.actions
+        ? JSON.parse(selectedDashboard.actions)
+        : [];
+      parsedSummaryCards = selectedDashboard.summary_cards
+        ? JSON.parse(selectedDashboard.summary_cards)
+        : [];
     } catch {
       // ignore
     }
   }
+
+  function getFilterOptions(filter: FilterDef): string[] {
+    if (filter.options && filter.options.length > 0) return filter.options;
+    if (!tableData || tableData.length === 0) return [];
+    const values = new Set<string>();
+    tableData.forEach((row) => {
+      if (row[filter.id] !== undefined) values.add(String(row[filter.id]));
+    });
+    return Array.from(values);
+  }
+
+  function computeAgg(field: string, agg: string): number | string {
+    const vals = tableData.map((d) => Number(d[field])).filter((v) => !isNaN(v));
+    if (vals.length === 0) return "-";
+    switch (agg) {
+      case "sum":
+        return vals.reduce((a, b) => a + b, 0);
+      case "avg":
+        return vals.reduce((a, b) => a + b, 0) / vals.length;
+      case "count":
+        return vals.length;
+      case "max":
+        return Math.max(...vals);
+      case "min":
+        return Math.min(...vals);
+      default:
+        return "-";
+    }
+  }
+
+  const handleExportCsv = () => {
+    if (tableData.length === 0) return;
+    const headers = Object.keys(tableData[0]);
+    const rows = tableData.map((row) =>
+      headers.map((h) => {
+        const v = row[h];
+        const s = v === null || v === undefined ? "" : String(v);
+        if (s.includes(",") || s.includes("\n") || s.includes('"')) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      }).join(",")
+    );
+    const csv = ["﻿" + headers.join(","), ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${selectedDashboard?.name || "export"}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="flex flex-col h-full overflow-auto"
@@ -414,6 +591,10 @@ export default function DashboardPage() {
                 dashboard={dashboard}
                 onView={handleViewDashboard}
                 onModify={handleModifyDashboard}
+                onDelete={(d) => {
+                  setDeletingDashboard(d);
+                  setDeleteMode("dashboard");
+                }}
               />
             ))}
           </div
@@ -505,26 +686,74 @@ export default function DashboardPage() {
               </div>
             )}
 
+            {selectedDashboard.html_content && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">HTML 内容</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {htmlLoading && (
+                    <div className="flex items-center justify-center gap-2 text-sm text-slate-500 py-8">
+                      <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
+                      正在加载 HTML 数据...
+                    </div>
+                  )}
+                  <iframe
+                    ref={iframeRef}
+                    srcDoc={htmlSrcDoc ?? selectedDashboard.html_content}
+                    style={{ width: "100%", border: "none", display: htmlLoading ? "none" : "block" }}
+                    sandbox="allow-scripts allow-same-origin"
+                    title="看板 HTML 内容"
+                    onLoad={() => {
+                      adjustIframeHeight();
+                      // echarts 等异步内容渲染后再调整一次
+                      setTimeout(adjustIframeHeight, 500);
+                      setTimeout(adjustIframeHeight, 1500);
+                    }}
+                  />
+                </CardContent>
+              </Card>
+            )}
+
             <SqlRepairTracker
               isActive={repairActive}
               onReset={() => setRepairActive(false)}
             />
 
-            {parsedFilters.length > 0 && (
+            {parsedSummaryCards.length > 0 && !selectedDashboard.html_content && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                {parsedSummaryCards.map((card, idx) => (
+                  <Card key={idx}>
+                    <CardContent className="p-4">
+                      <p className="text-xs text-slate-500">{card.title}</p>
+                      <p className="text-xl font-semibold text-slate-800">
+                        {computeAgg(card.field, card.agg)}
+                      </p>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
+
+            {parsedFilters.length > 0 && !selectedDashboard.html_content && (
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-sm"
-                  >动态筛选</CardTitle
-                  >
-                </CardHeader>
-                <CardContent className="flex flex-wrap gap-4"
-                >
-                  {parsedFilters.map((f) => (
-                    <div key={f.id} className="flex flex-col gap-1 min-w-[200px]"
-                    >
-                      <label className="text-sm font-medium"
-                      >{f.label}</label
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-sm">动态筛选</CardTitle>
+                    {parsedActions.includes("export_csv") && (
+                      <button
+                        onClick={handleExportCsv}
+                        className="inline-flex items-center gap-1 px-2 py-1 border rounded-md text-xs hover:bg-slate-50"
                       >
+                        <Download className="h-3 w-3" /> 导出 CSV
+                      </button>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent className="flex flex-wrap gap-4">
+                  {parsedFilters.map((f) => (
+                    <div key={f.id} className="flex flex-col gap-1 min-w-[200px]">
+                      <label className="text-sm font-medium">{f.label}</label>
                       {f.type === "select" ? (
                         <Select
                           value={filterValues[f.id] || ""}
@@ -534,14 +763,51 @@ export default function DashboardPage() {
                             <SelectValue placeholder="请选择" />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="option1"
-                            >选项一</SelectItem
-                            >
-                            <SelectItem value="option2"
-                            >选项二</SelectItem
-                            >
+                            {getFilterOptions(f).map((opt) => (
+                              <SelectItem key={opt} value={opt}>{opt}</SelectItem>
+                            ))}
                           </SelectContent>
                         </Select>
+                      ) : f.type === "multi_select" ? (
+                        <div className="flex flex-wrap gap-2">
+                          {getFilterOptions(f).map((opt) => {
+                            const current = filterValues[f.id] || "";
+                            const selected = current.split(",").filter(Boolean);
+                            const checked = selected.includes(opt);
+                            return (
+                              <label key={opt} className="inline-flex items-center gap-1 text-xs cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(e) => {
+                                    const vals = e.target.checked
+                                      ? [...selected, opt]
+                                      : selected.filter((s) => s !== opt);
+                                    updateFilter(f.id, vals.join(","));
+                                  }}
+                                  className="accent-blue-600"
+                                />
+                                <span>{opt}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : f.type === "date_range" ? (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="date"
+                            value={filterValues[`${f.id}_start`] || ""}
+                            onChange={(e) => updateFilter(`${f.id}_start`, e.target.value)}
+                            className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                          />
+                          <span className="text-xs text-slate-400">至</span>
+                          <input
+                            type="date"
+                            value={filterValues[`${f.id}_end`] || ""}
+                            onChange={(e) => updateFilter(`${f.id}_end`, e.target.value)}
+                            className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                          />
+                        </div>
                       ) : (
                         <input
                           placeholder={`输入${f.label}`}
@@ -556,6 +822,7 @@ export default function DashboardPage() {
               </Card>
             )}
 
+            {!selectedDashboard.html_content && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6"
             >
               {parsedCharts.includes("pie") && (
@@ -584,10 +851,24 @@ export default function DashboardPage() {
                   </CardContent>
                 </Card>
               )}
+              {parsedCharts.includes("line") && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2 text-sm"
+                    >
+                      <BarChart3 className="h-4 w-4" /> 折线图
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <ReactECharts option={lineOption} style={{ height: 300 }} />
+                  </CardContent>
+                </Card>
+              )}
             </div
             >
+            )}
 
-            {parsedCharts.includes("table") && tableData.length > 0 && (
+            {parsedCharts.includes("table") && tableData.length > 0 && !selectedDashboard.html_content && (
               <Card>
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2 text-sm"
@@ -630,6 +911,101 @@ export default function DashboardPage() {
           refreshDashboards();
         }}
       />
+
+      {/* 删除看板确认弹窗 */}
+      <Dialog open={!!deletingDashboard} onOpenChange={(open) => !open && setDeletingDashboard(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              确认删除看板"{deletingDashboard?.name}"
+            </DialogTitle>
+            <DialogDescription>
+              此操作不可恢复。请选择删除方式：
+            </DialogDescription>
+          </DialogHeader>
+
+          {(() => {
+            if (!deletingDashboard) return null;
+            const linkedTable = deletingDashboard.source_table || "";
+            const otherDashboardsUsingTable = dashboards.filter(
+              (d) =>
+                d.id !== deletingDashboard.id &&
+                ((d.source_table && d.source_table === linkedTable) ||
+                  (d.sql_template && d.sql_template.includes(linkedTable)))
+            );
+            const canDropTable = !!linkedTable && otherDashboardsUsingTable.length === 0;
+
+            return (
+              <div className="space-y-3 py-2">
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="delete-mode"
+                    className="mt-1 accent-blue-600"
+                    checked={deleteMode === "dashboard"}
+                    onChange={() => setDeleteMode("dashboard")}
+                  />
+                  <div className="text-sm">
+                    <p className="font-medium">仅删除看板</p>
+                    <p className="text-xs text-slate-500">看板配置被移除，数据库表不受影响</p>
+                  </div>
+                </label>
+
+                <label
+                  className={`flex items-start gap-2 ${canDropTable ? "cursor-pointer" : "opacity-50 cursor-not-allowed"}`}
+                >
+                  <input
+                    type="radio"
+                    name="delete-mode"
+                    className="mt-1 accent-red-600"
+                    disabled={!canDropTable}
+                    checked={deleteMode === "with_table"}
+                    onChange={() => canDropTable && setDeleteMode("with_table")}
+                  />
+                  <div className="text-sm">
+                    <p className="font-medium">同时删除底层数据表{linkedTable ? `（${linkedTable}）` : ""}</p>
+                    <p className="text-xs text-slate-500">
+                      {canDropTable
+                        ? "看板和对应的数据库表将一起被永久删除"
+                        : !linkedTable
+                        ? "该看板未关联任何数据库表"
+                        : `此表还被 ${otherDashboardsUsingTable.length} 个看板引用，先删除它们才能删除此表`}
+                    </p>
+                  </div>
+                </label>
+              </div>
+            );
+          })()}
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setDeletingDashboard(null)}>
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={async () => {
+                if (!deletingDashboard) return;
+                try {
+                  await invoke("delete_dashboard", { id: deletingDashboard.id });
+                  if (deleteMode === "with_table" && deletingDashboard.source_table) {
+                    await invoke("drop_user_table", {
+                      tableName: deletingDashboard.source_table,
+                    });
+                  }
+                  toast.success("看板已删除");
+                  setDeletingDashboard(null);
+                  setBoardsSelectedId(null);
+                  refreshDashboards();
+                } catch (e) {
+                  toast.error("删除失败: " + String(e));
+                }
+              }}
+            >
+              确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

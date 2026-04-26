@@ -68,10 +68,18 @@ export default function SessionSidebar({
             </div>
           )}
           {sessions.map((session) => (
-            <button
+            <div
               key={session.id}
               onClick={() => onSelectSession(session.id)}
-              className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors group text-left ${
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelectSession(session.id);
+                }
+              }}
+              className={`w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors group text-left cursor-pointer ${
                 currentSessionId === session.id
                   ? "bg-blue-100 text-blue-700"
                   : "text-slate-600 hover:bg-slate-100"
@@ -98,7 +106,7 @@ export default function SessionSidebar({
               >
                 <Trash2 className="h-3 w-3" />
               </Button>
-            </button>
+            </div>
           ))}
         </div>
       </ScrollArea>

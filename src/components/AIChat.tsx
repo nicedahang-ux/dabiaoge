@@ -2,13 +2,15 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
-import { Loader2, Bot, Clock, CheckCircle2, Circle, Zap, FileSpreadsheet, X } from "lucide-react";
+import { Loader2, Bot, Clock, CheckCircle2, Circle, Zap, FileSpreadsheet, X, Database } from "lucide-react";
 import InputArea, { type Attachment } from "@/components/InputArea";
 import MessageBubble from "@/components/MessageBubble";
 import ExecutionTracker from "@/components/ExecutionTracker";
 import { useApp, type ChatMessage, type Dashboard } from "@/lib/AppContext";
 import { estimateTokens } from "@/lib/thoughtGuideQuestions";
+import { formatBeijingTime } from "@/lib/utils";
 import IngestModal from "@/components/IngestModal";
+import DbTableSelectModal, { type DbTablePreview } from "@/components/DbTableSelectModal";
 
 interface StepStatus {
   id: string;
@@ -17,6 +19,13 @@ interface StepStatus {
 }
 
 interface TablePreviewPayload {
+  sheet_name: string;
+  columns: string[];
+  preview_data: string[][];
+}
+
+interface ChatTablePreview {
+  file_name: string;
   sheet_name: string;
   columns: string[];
   preview_data: string[][];
@@ -31,18 +40,6 @@ interface ModifyingState {
   status: "idle" | "updating" | "success" | "error";
   dashboardId?: string;
   error?: string;
-}
-
-function formatBeijingTime(date: Date): string {
-  return new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(date);
 }
 
 interface AIChatProps {
@@ -77,6 +74,15 @@ export default function AIChat({
   const [elapsedMs, setElapsedMs] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const messageRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const [nodePositions, setNodePositions] = useState<{ id: string; top: number; preview: string }[]>([]);
+  const [dbSelectOpen, setDbSelectOpen] = useState(false);
+  const [dbTablePreviews, setDbTablePreviews] = useState<DbTablePreview[]>([]);
+  const [retryStatus, setRetryStatus] = useState<{ active: boolean; attempt: number; total: number }>({
+    active: false,
+    attempt: 0,
+    total: 3,
+  });
 
   const currentSession = sessions.find((s) => s.id === sessionId);
   const [dashboardContext, setDashboardContext] = useState<string | null>(null);
@@ -85,7 +91,23 @@ export default function AIChat({
     if (dashboardTag) {
       invoke<Dashboard>("get_dashboard", { id: dashboardTag })
         .then((d) => {
-          const ctx = `当前正在修改的看板信息：\n- 名称：${d.name}\n- 描述：${d.description || "无"}\n- SQL模板：${d.sql_template || "无"}\n- 筛选器配置：${d.ui_filters || "[]"}\n- 图表配置：${d.charts || "[]"}\n请基于以上看板信息进行修改和优化。`;
+          let ctx = `当前正在修改的看板信息：\n- 名称：${d.name}\n- 描述：${d.description || "无"}\n- SQL模板：${d.sql_template || "无"}\n- 筛选器配置：${d.ui_filters || "[]"}\n- 图表配置：${d.charts || "[]"}\n`;
+          if (d.summary_cards) {
+            try { ctx += `- 摘要卡片：${d.summary_cards}\n`; } catch {}
+          }
+          if (d.actions) {
+            try { ctx += `- 操作按钮：${d.actions}\n`; } catch {}
+          }
+          if (d.table_data) {
+            try {
+              const rows = JSON.parse(d.table_data) as Record<string, unknown>[];
+              if (rows.length > 0) {
+                const preview = rows.slice(0, 10);
+                ctx += `- 明细数据前 ${preview.length} 行：\n${JSON.stringify(preview, null, 2)}\n`;
+              }
+            } catch {}
+          }
+          ctx += `请基于以上看板信息进行修改和优化。`;
           setDashboardContext(ctx);
         })
         .catch(() => setDashboardContext(null));
@@ -112,6 +134,29 @@ export default function AIChat({
       }
     };
   }, [loading, startTime]);
+
+  // 计算用户消息节点位置
+  useEffect(() => {
+    const update = () => {
+      const container = scrollRef.current;
+      if (!container) return;
+      const nodes: { id: string; top: number; preview: string }[] = [];
+      container.querySelectorAll("[data-role='user']").forEach((el) => {
+        const htmlEl = el as HTMLElement;
+        nodes.push({
+          id: htmlEl.dataset.msgId || "",
+          top: htmlEl.offsetTop + htmlEl.offsetHeight / 2,
+          preview: (htmlEl.dataset.preview || "").slice(0, 30),
+        });
+      });
+      setNodePositions(nodes);
+    };
+    update();
+    const el = scrollRef.current;
+    const ro = new ResizeObserver(update);
+    if (el) ro.observe(el);
+    return () => ro.disconnect();
+  }, [messages]);
 
   useEffect(() => {
     if (currentSession) {
@@ -214,13 +259,14 @@ export default function AIChat({
   }, []);
 
   // 从 AI 回复中提取 action JSON
-  const extractActionJson = useCallback((content: string): { action: string; dashboard?: any; table_name?: string; clean_sql?: string } | null => {
+  const extractActionJson = useCallback((content: string): { action: string; dashboard?: any; table_name?: string; clean_sql?: string; sql?: string } | null => {
     const cleaned = stripMarkdownCodeBlocks(content);
     // 策略1：精确匹配 action 字段
     const patterns = [
       /\{\s*"action"\s*:\s*"create_dashboard"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
       /\{\s*"action"\s*:\s*"update_dashboard"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
       /\{\s*"action"\s*:\s*"ingest"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
+      /\{\s*"action"\s*:\s*"run_sql"[\s\S]*?\}(?![\s\S]*\{\s*"action"\s*:)/,
     ];
     for (const pattern of patterns) {
       const match = cleaned.match(pattern);
@@ -257,6 +303,48 @@ export default function AIChat({
     return null;
   }, [stripMarkdownCodeBlocks]);
 
+  // 规范化 AI 返回的 action JSON，处理常见字段名不匹配问题
+  const normalizeActionJson = useCallback((raw: any): any => {
+    if (!raw || !raw.action) return raw;
+    const normalized = { ...raw };
+
+    // 处理 create_dashboard / update_dashboard
+    if (["create_dashboard", "update_dashboard"].includes(raw.action)) {
+      let dashboard = raw.dashboard;
+
+      // AI 经常漏掉 dashboard 包装层，把字段直接放在顶层
+      if (!dashboard && (raw.name || raw.title || raw.sql_template || raw.filters || raw.charts)) {
+        const { action: _, ...rest } = raw;
+        dashboard = rest;
+        normalized.dashboard = dashboard;
+      }
+
+      if (dashboard && typeof dashboard === "object") {
+        // 字段名映射：AI 常犯的错误
+        if (dashboard.title && !dashboard.name) dashboard.name = dashboard.title;
+        if (dashboard.sheet_name && !dashboard.source_table) dashboard.source_table = dashboard.sheet_name;
+        if (dashboard.filters && !dashboard.ui_filters) dashboard.ui_filters = dashboard.filters;
+
+        // charts 可能是对象数组（AI 常犯错误），需要提取 type 字段转成字符串数组
+        if (Array.isArray(dashboard.charts)) {
+          const chartArray = dashboard.charts;
+          if (chartArray.length > 0 && typeof chartArray[0] === "object" && chartArray[0].type) {
+            dashboard.charts = chartArray
+              .map((c: any) => c.type)
+              .filter((t: string) => ["pie", "bar", "line", "table"].includes(t));
+          }
+        }
+
+        // 确保 sql_template 至少有值（AI 有时会漏掉）
+        if (!dashboard.sql_template) {
+          dashboard.sql_template = `SELECT * FROM ${dashboard.source_table || "temp_table"}`;
+        }
+      }
+    }
+
+    return normalized;
+  }, []);
+
   // 自动更新看板 — 只传 AI 明确给出的字段，防止清空现有数据
   // 特别注意：table_data 由系统从数据库自动查询填充，绝不从前端/AI 更新覆盖
   const autoUpdateDashboard = useCallback(async (dashboardConfig: any) => {
@@ -269,6 +357,8 @@ export default function AIChat({
       if ("sql_template" in dashboardConfig) payload.sqlTemplate = dashboardConfig.sql_template || "";
       if ("ui_filters" in dashboardConfig) payload.uiFilters = JSON.stringify(dashboardConfig.ui_filters || []);
       if ("charts" in dashboardConfig) payload.charts = JSON.stringify(dashboardConfig.charts || []);
+      if ("actions" in dashboardConfig) payload.actions = JSON.stringify(dashboardConfig.actions || []);
+      if ("summary_cards" in dashboardConfig) payload.summaryCards = JSON.stringify(dashboardConfig.summary_cards || []);
       // 严禁传递 table_data，防止 AI 误清空看板数据
       // if ("table_data" in dashboardConfig) payload.tableData = ...
       if ("source_table" in dashboardConfig) payload.sourceTable = dashboardConfig.source_table || "";
@@ -291,6 +381,7 @@ export default function AIChat({
             content: m.content,
             timestamp: m.timestamp,
             duration_ms: m.durationMs,
+            attachments: m.attachments,
           })),
           tokenCount: newTokenCount,
           title: newTitle,
@@ -307,34 +398,37 @@ export default function AIChat({
   const handleSend = async (text: string, files: Attachment[]) => {
     if ((!text.trim() && files.length === 0) || loading) return;
 
-    // 表格附件：取第一份做 20 行预览,覆盖工具条加载的预览(如有)
     let effectivePreview = filePreview;
     let effectivePath = filePath;
     let appendedNote = "";
+    const allTablePreviews: ChatTablePreview[] = [];
+
+    // 表格附件：遍历所有表格做 20 行预览
     const tableAttachments = files.filter(
       (f) => f.isTable && !!f.path && TABLE_EXTS.includes(((f.path || "").split(".").pop() || "").toLowerCase())
     );
     if (tableAttachments.length > 0) {
-      const ta = tableAttachments[0];
-      try {
-        setParsingFile(true);
-        const preview = await parseTablePreview(ta.path!);
-        if (preview) {
-          effectivePreview = preview;
-          effectivePath = ta.path!;
-          setFilePreview(preview);
-          setFilePath(ta.path!);
-          toast.success(
-            `表格附件已处理: ${preview.sheet_name}（${preview.columns.length}列, 取前 ${preview.preview_data.length} 行送 AI）`
-          );
+      setParsingFile(true);
+      for (const ta of tableAttachments) {
+        try {
+          const preview = await parseTablePreview(ta.path!);
+          if (preview) {
+            allTablePreviews.push({
+              file_name: ta.path!.split(/[\\/]/).pop() ?? ta.path!,
+              sheet_name: preview.sheet_name,
+              columns: preview.columns,
+              preview_data: preview.preview_data,
+            });
+          }
+        } catch (e) {
+          toast.error(`解析表格附件失败(${ta.displayName}): ` + String(e));
         }
-      } catch (e) {
-        toast.error("解析表格附件失败: " + String(e));
-      } finally {
-        setParsingFile(false);
       }
-      if (tableAttachments.length > 1) {
-        toast.info(`检测到 ${tableAttachments.length} 个表格附件,本次仅使用第一个: ${ta.displayName}`);
+      setParsingFile(false);
+      if (allTablePreviews.length > 0) {
+        toast.success(
+          `表格附件已处理: 共 ${allTablePreviews.length} 份表格（各取前 20 行送 AI）`
+        );
       }
     }
 
@@ -424,12 +518,108 @@ export default function AIChat({
       if (dashboardContext) {
         history = [{ role: "system", content: dashboardContext }, ...history];
       }
-      const res = await invoke<string>("chat_workbench", {
-        messages: history,
-        tablePreview: effectivePreview,
-        thoughtGuideMode,
-        modifyingDashboard: !!dashboardTag,
-      });
+
+      const callChat = async (hist: typeof history): Promise<string> => {
+        return await invoke<string>("chat_workbench", {
+          messages: hist,
+          tablePreview: effectivePreview,
+          dbTablePreviews: dbTablePreviews.length > 0 ? dbTablePreviews : null,
+          chatAttachmentPreviews: allTablePreviews.length > 0 ? allTablePreviews : null,
+          thoughtGuideMode,
+          modifyingDashboard: !!dashboardTag,
+        });
+      };
+
+      // 抽出的局部函数：执行一次 AI 调用（含 run_sql 二轮）
+      const tryGetDashboard = async (
+        hist: typeof history,
+        currentMessages: ChatMessage[],
+        currentTokenCount: number
+      ): Promise<{ res: string; nextMessages: ChatMessage[]; nextTokenCount: number }> => {
+        let res = await callChat(hist);
+        const firstAction = normalizeActionJson(extractActionJson(res));
+        if (firstAction?.action === "run_sql" && firstAction.sql) {
+          try {
+            const sqlRes = await invoke<{ columns: string[]; rows: string[][] }>("run_sql_query_for_chat", {
+              sql: firstAction.sql,
+            });
+            const sqlResultText = `SQL 查询结果：\n列: ${JSON.stringify(sqlRes.columns)}\n数据: ${JSON.stringify(sqlRes.rows.slice(0, 20))}`;
+            const firstAssistantMsg: ChatMessage = {
+              id: `assistant-${Date.now()}`,
+              role: "assistant",
+              content: sanitizeAssistantContent(res.replace(JSON.stringify(firstAction), "").trim()) || res.replace(JSON.stringify(firstAction), "").trim(),
+              timestamp: formatBeijingTime(new Date()),
+              durationMs: Date.now() - reqStartTime,
+            };
+            const midMessages = [...currentMessages, firstAssistantMsg];
+            setMessages(midMessages);
+            const midTokenCount = currentTokenCount + estimateTokens(res);
+            setTokenCount(midTokenCount);
+            await persistSession(midMessages, midTokenCount);
+
+            let secondHistory: { role: string; content: string }[] = midMessages.map((m) => ({ role: m.role, content: m.content }));
+            secondHistory.push({ role: "system", content: sqlResultText });
+            if (dashboardContext) {
+              secondHistory = [{ role: "system", content: dashboardContext }, ...secondHistory];
+            }
+            res = await callChat(secondHistory);
+            return { res, nextMessages: midMessages, nextTokenCount: midTokenCount };
+          } catch (sqlErr) {
+            toast.error("AI 自动查库失败: " + String(sqlErr));
+          }
+        }
+        return { res, nextMessages: currentMessages, nextTokenCount: currentTokenCount };
+      };
+
+      // 初始调用
+      let currentMessages = newMessages;
+      let currentTokenCount = newTokenCount;
+      let { res, nextMessages, nextTokenCount } = await tryGetDashboard(history, currentMessages, currentTokenCount);
+      currentMessages = nextMessages;
+      currentTokenCount = nextTokenCount;
+
+      // 兜底重试循环
+      const TARGET_ACTIONS = ["create_dashboard", "update_dashboard"];
+      const isDashboardAction = (a: any) => a && TARGET_ACTIONS.includes(a.action);
+      let retries = 0;
+      const MAX_RETRY = 3;
+      const userAnswerRounds = currentMessages.filter((m) => m.role === "user").length;
+
+      while (!isDashboardAction(normalizeActionJson(extractActionJson(res)))) {
+        const extractedNow = normalizeActionJson(extractActionJson(res));
+        // AI 还在合理提问 → break
+        if (res.includes("【关键提问】") && userAnswerRounds < 5) break;
+        // 合法 ingest 动作 → break
+        if (extractedNow && extractedNow.action === "ingest") break;
+
+        retries++;
+        if (retries > MAX_RETRY) {
+          toast.error(`AI 在 ${MAX_RETRY} 次重试后仍未生成看板，请检查信息是否充分`);
+          break;
+        }
+
+        setRetryStatus({ active: true, attempt: retries, total: MAX_RETRY });
+
+        // 移除上一轮 escalation，避免堆叠
+        if (retries > 1 && (history[history.length - 1] as any)?._isEscalation) {
+          history.pop();
+        }
+
+        const escalation =
+          retries === 1
+            ? "请基于以上对话内容，直接输出可执行的 create_dashboard JSON。禁止再使用 run_sql，禁止再提问，信息不足时合理推测填充。JSON 必须严格符合系统提示中的格式要求。特别注意：必须有 dashboard 包装层，字段名必须是 name/sql_template/ui_filters/charts/source_table，严禁使用 title/filters/sheet_name 等字段名。"
+            : retries === 2
+            ? '【系统强制】你必须立即输出纯文本 JSON，格式如下（严禁 markdown 代码块，禁止任何其它文字）：\n{"action":"create_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT * FROM 表名","ui_filters":[],"charts":["pie","bar"],"source_table":"表名"}}\n注意：dashboard 对象内字段名必须是 name/sql_template/ui_filters/charts/source_table，charts 必须是字符串数组（如 ["pie","bar"]），严禁使用 title/filters/sheet_name/calculated_fields。'
+            : '【最后一次机会】严格输出以下格式，任何偏差都将导致失败：\n{"action":"create_dashboard","dashboard":{"name":"...","description":"...","sql_template":"...","ui_filters":[],"charts":["pie","bar","line","table"],"actions":[],"summary_cards":[],"source_table":"..."}}';
+
+        const escMsg: any = { role: "user", content: escalation, _isEscalation: true };
+        history.push(escMsg);
+        ({ res, nextMessages, nextTokenCount } = await tryGetDashboard(history, currentMessages, currentTokenCount));
+        currentMessages = nextMessages;
+        currentTokenCount = nextTokenCount;
+      }
+
+      setRetryStatus({ active: false, attempt: 0, total: MAX_RETRY });
 
       setSteps((prev) =>
         prev.map((s) =>
@@ -444,8 +634,7 @@ export default function AIChat({
       let displayContent = res;
       let parsedDashboard: any = null;
 
-      // 使用鲁棒的 JSON 提取器解析 AI 回复中的 action
-      const extractedAction = extractActionJson(res);
+      const extractedAction = normalizeActionJson(extractActionJson(res));
 
       if (extractedAction) {
         const jsonRaw = JSON.stringify(extractedAction);
@@ -463,6 +652,8 @@ export default function AIChat({
               charts: JSON.stringify(parsedDashboard.charts || []),
               tableData: JSON.stringify(parsedDashboard.table_data || []),
               sourceTable: parsedDashboard.source_table || "",
+              actions: JSON.stringify(parsedDashboard.actions || []),
+              summaryCards: JSON.stringify(parsedDashboard.summary_cards || []),
             });
             setModifyingState({ status: "success", dashboardId: newId });
             refreshDashboards();
@@ -514,10 +705,10 @@ export default function AIChat({
         durationMs: Date.now() - reqStartTime,
       };
 
-      const finalMessages = [...newMessages, assistantMsg];
+      const finalMessages = [...currentMessages, assistantMsg];
       setMessages(finalMessages);
 
-      const finalTokenCount = newTokenCount + estimateTokens(res);
+      const finalTokenCount = currentTokenCount + estimateTokens(res);
       setTokenCount(finalTokenCount);
       await persistSession(finalMessages, finalTokenCount);
 
@@ -535,6 +726,7 @@ export default function AIChat({
     } finally {
       setLoading(false);
       setStartTime(null);
+      setRetryStatus({ active: false, attempt: 0, total: 3 });
     }
   };
 
@@ -568,6 +760,10 @@ export default function AIChat({
     }
   };
 
+  const handleClearDbTables = () => {
+    setDbTablePreviews([]);
+  };
+
   const latestAssistantId =
     messages.length > 0 && messages[messages.length - 1].role === "assistant"
       ? messages[messages.length - 1].id
@@ -591,6 +787,14 @@ export default function AIChat({
             )}
             {filePreview ? "更换表格" : "加载表格供 AI 分析"}
           </button>
+          <button
+            onClick={() => setDbSelectOpen(true)}
+            disabled={parsingFile || loading}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border bg-white text-xs hover:bg-slate-50 disabled:opacity-50"
+          >
+            <Database className="h-3.5 w-3.5 text-blue-600" />
+            {dbTablePreviews.length > 0 ? "更换数据库" : "选择数据库"}
+          </button>
           {filePreview && (
             <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium">
               <FileSpreadsheet className="h-3 w-3" />
@@ -609,81 +813,133 @@ export default function AIChat({
               </button>
             </span>
           )}
-          {!filePreview && (
+          {dbTablePreviews.length > 0 && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-blue-100 text-blue-700 text-xs font-medium">
+              <Database className="h-3 w-3" />
+              <span>已选 {dbTablePreviews.length} 张表</span>
+              <button
+                onClick={handleClearDbTables}
+                className="ml-1 hover:text-blue-900"
+                title="清除"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
+          {!filePreview && dbTablePreviews.length === 0 && (
             <span className="text-xs text-slate-400">
-              选择 xlsx/xls/csv 后,AI 才能看到表头与样例数据来生成看板
+              选择 xlsx/xls/csv 或数据库表后,AI 才能看到数据来生成看板
             </span>
           )}
         </div>
       </div>
 
-      <div className="flex-1 px-4 overflow-y-auto overflow-x-hidden min-h-0" ref={scrollRef}>
-        <div className="space-y-4 py-4 max-w-4xl mx-auto">
-          {messages.map((msg) => (
-            <MessageBubble
-              key={msg.id}
-              message={msg}
-              thoughtGuideMode={thoughtGuideMode}
-              isSubmitted={submittedMessageIds.has(msg.id)}
-              onSubmitAnswers={handleThoughtSubmit}
-              isLatestAssistant={msg.id === latestAssistantId}
-            />
-          ))}
-
-          {_modifyTrackerActive && (
-            <ExecutionTracker isActive={_modifyTrackerActive} />
-          )}
-
-          {loading && !_modifyTrackerActive && (
-            <div className="flex gap-3">
-              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center">
-                <Bot className="h-4 w-4" />
+      <div className="flex-1 relative">
+        <div className="absolute inset-0 overflow-y-auto overflow-x-hidden px-4 pr-7" ref={scrollRef}>
+          <div className="space-y-4 py-4 max-w-4xl mx-auto">
+            {messages.map((msg) => (
+              <div
+                key={msg.id}
+                ref={(el) => { messageRefs.current[msg.id] = el; }}
+                data-role={msg.role}
+                data-msg-id={msg.id}
+                data-preview={msg.content.slice(0, 30)}
+              >
+                <MessageBubble
+                  message={msg}
+                  thoughtGuideMode={thoughtGuideMode}
+                  isSubmitted={submittedMessageIds.has(msg.id)}
+                  onSubmitAnswers={handleThoughtSubmit}
+                  isLatestAssistant={msg.id === latestAssistantId}
+                />
               </div>
-              <div className="bg-slate-100 rounded-lg px-4 py-3 space-y-2 min-w-[280px]">
-                <div className="flex items-center gap-2">
-                  <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
-                  <span className="text-sm font-medium text-slate-700">
-                    AI 正在处理...
-                  </span>
-                  <span className="text-xs text-slate-400 ml-auto flex items-center gap-1">
-                    <Clock className="h-3 w-3" />
-                    {(elapsedMs / 1000).toFixed(1)}s
-                  </span>
+            ))}
+
+            {_modifyTrackerActive && (
+              <ExecutionTracker isActive={_modifyTrackerActive} />
+            )}
+
+            {loading && !_modifyTrackerActive && (
+              <div className="flex gap-3">
+                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center">
+                  <Bot className="h-4 w-4" />
                 </div>
-                <div className="space-y-1.5">
-                  {steps.map((step) => (
-                    <div key={step.id} className="flex items-center gap-2 text-xs">
-                      {step.status === "completed" ? (
-                        <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
-                      ) : step.status === "active" ? (
-                        <Zap className="h-3.5 w-3.5 text-blue-500 animate-pulse" />
-                      ) : step.status === "error" ? (
-                        <Circle className="h-3.5 w-3.5 text-red-400" />
-                      ) : (
-                        <Circle className="h-3.5 w-3.5 text-slate-300" />
-                      )}
-                      <span
-                        className={
-                          step.status === "active"
-                            ? "text-blue-600 font-medium"
-                            : step.status === "completed"
-                            ? "text-slate-600"
-                            : step.status === "error"
-                            ? "text-red-500"
-                            : "text-slate-400"
-                        }
-                      >
-                        {step.label}
-                        {step.status === "active" && "..."}
-                      </span>
-                    </div>
-                  ))}
+                <div className="bg-slate-100 rounded-lg px-4 py-3 space-y-2 min-w-[280px]">
+                  <div className="flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
+                    <span className="text-sm font-medium text-slate-700">
+                      AI 正在处理...
+                    </span>
+                    <span className="text-xs text-slate-400 ml-auto flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      {(elapsedMs / 1000).toFixed(1)}s
+                    </span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {steps.map((step) => (
+                      <div key={step.id} className="flex items-center gap-2 text-xs">
+                        {step.status === "completed" ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
+                        ) : step.status === "active" ? (
+                          <Zap className="h-3.5 w-3.5 text-blue-500 animate-pulse" />
+                        ) : step.status === "error" ? (
+                          <Circle className="h-3.5 w-3.5 text-red-400" />
+                        ) : (
+                          <Circle className="h-3.5 w-3.5 text-slate-300" />
+                        )}
+                        <span
+                          className={
+                            step.status === "active"
+                              ? "text-blue-600 font-medium"
+                              : step.status === "completed"
+                              ? "text-slate-600"
+                              : step.status === "error"
+                              ? "text-red-500"
+                              : "text-slate-400"
+                          }
+                        >
+                          {step.label}
+                          {step.status === "active" && "..."}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
+
+        {/* User message nodes */}
+        {nodePositions.length > 0 && (
+          <div className="absolute right-2 top-0 bottom-0 w-3 pointer-events-none">
+            {nodePositions.map((node) => (
+              <button
+                key={node.id}
+                className="absolute -translate-y-1/2 w-2 h-2 rounded-full bg-blue-400 hover:bg-blue-600 pointer-events-auto transition-colors"
+                style={{ top: `${node.top}px` }}
+                onClick={() => {
+                  const el = messageRefs.current[node.id];
+                  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                }}
+                title={node.preview}
+              />
+            ))}
+          </div>
+        )}
       </div>
+
+      {/* Retry Status */}
+      {retryStatus.active && (
+        <div className="px-4 pb-2 max-w-4xl mx-auto w-full">
+          <div className="border border-orange-200 bg-orange-50 rounded-lg p-4 flex items-center gap-3">
+            <Loader2 className="h-4 w-4 animate-spin text-orange-600" />
+            <span className="text-sm font-medium text-orange-800">
+              AI 沉默中，正在第 {retryStatus.attempt}/{retryStatus.total} 次强制重试...
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Dashboard Action Area */}
       {modifyingState.status === "updating" && (
@@ -734,6 +990,12 @@ export default function AIChat({
         tableName={suggestion?.table_name || "t_data"}
         open={ingestOpen}
         onOpenChange={setIngestOpen}
+      />
+
+      <DbTableSelectModal
+        open={dbSelectOpen}
+        onClose={() => setDbSelectOpen(false)}
+        onConfirm={(previews) => setDbTablePreviews(previews)}
       />
     </div
     >

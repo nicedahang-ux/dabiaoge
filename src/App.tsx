@@ -55,9 +55,9 @@ function ShareButton() {
   return (
     <Popover>
       <PopoverTrigger>
-        <Button variant="outline" size="sm" className="gap-1">
+        <span className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-sm font-medium border border-slate-200 bg-white hover:bg-slate-50 cursor-pointer">
           <Share2 className="h-4 w-4" /> 分享看板
-        </Button>
+        </span>
       </PopoverTrigger>
       <PopoverContent className="w-80 space-y-3">
         <div className="space-y-2">
@@ -101,7 +101,7 @@ function ShareButton() {
 }
 
 function MainLayout() {
-  const { activeView, switchView } = useApp();
+  const { activeView, switchView, botStatus } = useApp();
 
   useEffect(() => {
     async function autoStartBot() {
@@ -154,8 +154,8 @@ function MainLayout() {
         </nav>
         <div className="p-4 border-t border-slate-200 space-y-2">
           <div className="flex items-center gap-2 text-xs text-slate-500">
-            <div className="h-2 w-2 rounded-full bg-green-500" />
-            钉钉服务监听中...
+            <div className={`h-2 w-2 rounded-full ${botStatus === "connected" ? "bg-green-500" : "bg-red-500"}`} />
+            {botStatus === "connected" ? "钉钉服务监听中..." : "钉钉服务未连接"}
           </div>
         </div>
       </aside>

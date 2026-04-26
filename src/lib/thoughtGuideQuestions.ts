@@ -1,6 +1,49 @@
+export interface ThoughtOption {
+  key: string;
+  text: string;
+}
+
 export interface ThoughtQuestion {
   number: number;
   text: string;
+  options?: ThoughtOption[];
+}
+
+const Q_LINE = /^(\d+)\s*[.．、)）]\s*(.+)$/;
+const OPTION_LINE = /^([A-Za-z]|[①-⑩])\s*[.．、)）]\s*(.+)$/;
+
+const CIRCLED_NUM_TO_LETTER: Record<string, string> = {
+  "①": "A", "②": "B", "③": "C", "④": "D", "⑤": "E",
+  "⑥": "F", "⑦": "G", "⑧": "H", "⑨": "I", "⑩": "J",
+};
+
+function normalizeKey(raw: string): string {
+  if (CIRCLED_NUM_TO_LETTER[raw]) return CIRCLED_NUM_TO_LETTER[raw];
+  return raw.toUpperCase();
+}
+
+function extractInlineOptions(text: string): { cleanText: string; options: ThoughtOption[] } {
+  const inlineRegex = /([A-Za-z]|[①-⑩])\s*[.．、)）]\s*([^A-Za-z①-⑩\n]+?)(?=\s+([A-Za-z]|[①-⑩])\s*[.．、)）]|$)/g;
+  const opts: ThoughtOption[] = [];
+  const matches: { full: string; key: string; text: string }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = inlineRegex.exec(text)) !== null) {
+    matches.push({ full: m[0], key: normalizeKey(m[1]), text: m[2].trim() });
+  }
+  if (matches.length >= 2) {
+    const seen = new Set<string>();
+    for (const it of matches) {
+      if (seen.has(it.key)) continue;
+      seen.add(it.key);
+      opts.push({ key: it.key, text: it.text });
+    }
+    let cleanText = text;
+    for (const it of matches) {
+      cleanText = cleanText.replace(it.full, "");
+    }
+    return { cleanText: cleanText.trim(), options: opts };
+  }
+  return { cleanText: text, options: [] };
 }
 
 export function parseThoughtQuestions(content: string): ThoughtQuestion[] | null {
@@ -10,17 +53,50 @@ export function parseThoughtQuestions(content: string): ThoughtQuestion[] | null
   if (!questionBlockMatch) return null;
 
   const block = questionBlockMatch[0];
+  const lines = block.split("\n").map((l) => l.trimEnd());
   const questions: ThoughtQuestion[] = [];
+  let i = 0;
 
-  const lines = block.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const match = trimmed.match(/^(\d+)[.．、\s]+(.+)$/);
-    if (match) {
-      questions.push({
-        number: parseInt(match[1], 10),
-        text: match[2].trim(),
-      });
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const qMatch = line.match(Q_LINE);
+    if (qMatch) {
+      const number = parseInt(qMatch[1], 10);
+      let text = qMatch[2].trim();
+      let options: ThoughtOption[] = [];
+
+      const inline = extractInlineOptions(text);
+      if (inline.options.length >= 2) {
+        text = inline.cleanText || text;
+        options = inline.options;
+        i++;
+      } else {
+        i++;
+        while (i < lines.length) {
+          const optLine = lines[i].trim();
+          const optMatch = optLine.match(OPTION_LINE);
+          if (optMatch) {
+            const key = normalizeKey(optMatch[1]);
+            if (!options.some((o) => o.key === key)) {
+              options.push({ key, text: optMatch[2].trim() });
+            }
+            i++;
+          } else if (optLine === "") {
+            i++;
+            break;
+          } else if (Q_LINE.test(optLine)) {
+            break;
+          } else {
+            if (options.length > 0) break;
+            text += "\n" + optLine;
+            i++;
+          }
+        }
+      }
+
+      questions.push({ number, text, options: options.length > 0 ? options : undefined });
+    } else {
+      i++;
     }
   }
 

@@ -1,16 +1,9 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { User, Bot, CheckCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { parseThoughtQuestions, formatThoughtSubmission } from "@/lib/thoughtGuideQuestions";
-
-export interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  timestamp?: string;
-  durationMs?: number;
-}
+import type { ChatMessage } from "@/lib/AppContext";
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -28,6 +21,12 @@ export default function MessageBubble({
   isLatestAssistant,
 }: MessageBubbleProps) {
   const [answers, setAnswers] = useState<string[]>([]);
+  const [selectedOptions, setSelectedOptions] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    setSelectedOptions({});
+    setAnswers([]);
+  }, [message.id]);
   const questions =
     thoughtGuideMode &&
     message.role === "assistant" &&
@@ -37,6 +36,23 @@ export default function MessageBubble({
       : null;
 
   const hasQuestions = questions && questions.length > 0;
+
+  const handleSelectOption = (idx: number, key: string, text: string) => {
+    setSelectedOptions((prev) => ({ ...prev, [idx]: key }));
+    if (key !== "other") {
+      setAnswers((prev) => {
+        const next = [...prev];
+        next[idx] = `${key}. ${text}`;
+        return next;
+      });
+    } else {
+      setAnswers((prev) => {
+        const next = [...prev];
+        next[idx] = prev[idx] || "";
+        return next;
+      });
+    }
+  };
 
   const handleAnswerChange = (index: number, value: string) => {
     setAnswers((prev) => {
@@ -111,6 +127,24 @@ export default function MessageBubble({
             )}
           </div>
           <div className="whitespace-pre-wrap break-words overflow-hidden">{message.content}</div>
+          {message.attachments && message.attachments.length > 0 && (
+            <div className="mt-2 space-y-2">
+              {message.attachments.map((att, i) =>
+                att.mimeType.startsWith("image/") ? (
+                  <img
+                    key={i}
+                    src={`data:${att.mimeType};base64,${att.data}`}
+                    alt={att.filename}
+                    className="max-w-full max-h-[300px] rounded-md object-contain"
+                  />
+                ) : (
+                  <div key={i} className="text-xs opacity-80">
+                    📎 {att.filename}
+                  </div>
+                )
+              )}
+            </div>
+          )}
         </div>
 
         {/* Thought Guidance Q&A Area */}
@@ -120,21 +154,65 @@ export default function MessageBubble({
               在此填写澄清回答（Ctrl / Cmd + Enter 可提交）
             </p>
 
-            {questions!.map((q, idx) => (
-              <div key={q.number} className="space-y-1">
+            {questions!.map((q, idx) => {
+              // 去重选项 key，防止 AI 重复输出同 key
+              const uniqueOptions = q.options
+                ? Array.from(new Map(q.options.map((o) => [o.key, o])).values())
+                : [];
+              return (
+              <div key={`${idx}-${q.number}`} className="space-y-1">
                 <p className="text-xs text-amber-800 font-medium">
                   问题 {q.number}: {q.text}
                 </p>
-                <textarea
-                  value={answers[idx] || ""}
-                  onChange={(e) => handleAnswerChange(idx, e.target.value)}
-                  onKeyDown={(e) => handleKeyDown(e, idx)}
-                  placeholder={`填写问题 ${q.number} 的回答...`}
-                  className="w-full min-h-[48px] px-2 py-1 text-xs rounded border border-amber-200 bg-white resize-none outline-none focus:border-amber-400"
-                  rows={2}
-                />
+                {uniqueOptions.length > 0 ? (
+                  <div className="space-y-1">
+                    {uniqueOptions.map((opt) => (
+                      <label key={opt.key} className="flex items-center gap-2 text-sm cursor-pointer">
+                        <input
+                          type="radio"
+                          name={`q-${q.number}-${idx}`}
+                          checked={selectedOptions[idx] === opt.key}
+                          onChange={() => handleSelectOption(idx, opt.key, opt.text)}
+                          className="accent-amber-600"
+                        />
+                        <span className="text-xs text-amber-900">
+                          {opt.key}. {opt.text}
+                        </span>
+                      </label>
+                    ))}
+                    <label className="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="radio"
+                        name={`q-${q.number}-${idx}`}
+                        checked={selectedOptions[idx] === "other"}
+                        onChange={() => handleSelectOption(idx, "other", "")}
+                        className="accent-amber-600"
+                      />
+                      <span className="text-xs text-amber-900">其它</span>
+                    </label>
+                    {selectedOptions[idx] === "other" && (
+                      <textarea
+                        value={answers[idx] || ""}
+                        onChange={(e) => handleAnswerChange(idx, e.target.value)}
+                        onKeyDown={(e) => handleKeyDown(e, idx)}
+                        placeholder={`填写问题 ${q.number} 的其它回答...`}
+                        className="w-full min-h-[48px] px-2 py-1 text-xs rounded border border-amber-200 bg-white resize-none outline-none focus:border-amber-400"
+                        rows={2}
+                      />
+                    )}
+                  </div>
+                ) : (
+                  <textarea
+                    value={answers[idx] || ""}
+                    onChange={(e) => handleAnswerChange(idx, e.target.value)}
+                    onKeyDown={(e) => handleKeyDown(e, idx)}
+                    placeholder={`填写问题 ${q.number} 的回答...`}
+                    className="w-full min-h-[48px] px-2 py-1 text-xs rounded border border-amber-200 bg-white resize-none outline-none focus:border-amber-400"
+                    rows={2}
+                  />
+                )}
               </div>
-            ))}
+            );})}
 
             <Button
               size="sm"

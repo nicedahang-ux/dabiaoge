@@ -4,6 +4,7 @@ import {
   Database,
   Table2,
   Trash2,
+  Pencil,
   RefreshCw,
   Loader2,
   Columns3,
@@ -93,6 +94,12 @@ export default function DatabaseView() {
   const [editingRemark, setEditingRemark] = useState<string>("");
   const [remarkValue, setRemarkValue] = useState("");
 
+  // Table-level remark states
+  const [tableRemarks, setTableRemarks] = useState<Record<string, string>>({});
+  const [tableRemarkOpen, setTableRemarkOpen] = useState(false);
+  const [tableRemarkTarget, setTableRemarkTarget] = useState("");
+  const [tableRemarkValue, setTableRemarkValue] = useState("");
+
   // Modal states
   const [uploadOpen, setUploadOpen] = useState(false);
   const [codeOpen, setCodeOpen] = useState(false);
@@ -114,6 +121,19 @@ export default function DatabaseView() {
       if (res.length > 0 && !selectedTable) {
         setSelectedTable(res[0]);
       }
+      // 加载表级备注
+      const remarksMap: Record<string, string> = {};
+      await Promise.all(
+        res.map(async (t) => {
+          try {
+            const r = await invoke<string>("get_table_remark", { tableName: t });
+            if (r) remarksMap[t] = r;
+          } catch {
+            // ignore
+          }
+        })
+      );
+      setTableRemarks(remarksMap);
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -371,6 +391,24 @@ export default function DatabaseView() {
                   <div className="flex items-center gap-2 w-full">
                     <Table2 className="h-4 w-4 flex-shrink-0" />
                     <span className="flex-1 text-left truncate">{table}</span>
+                    {tableRemarks[table] && (
+                      <span className="text-[10px] text-slate-400 italic truncate max-w-[120px]">
+                        {tableRemarks[table]}
+                      </span>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTableRemarkTarget(table);
+                        setTableRemarkValue(tableRemarks[table] || "");
+                        setTableRemarkOpen(true);
+                      }}
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </Button>
                     <Button
                       variant="ghost"
                       size="sm"
@@ -782,6 +820,74 @@ export default function DatabaseView() {
             <Button onClick={handleBatchUpdate}>
               <Save className="mr-2 h-4 w-4" />
               确认修改
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 表备注编辑弹窗 */}
+      <Dialog open={tableRemarkOpen} onOpenChange={setTableRemarkOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>编辑表备注</DialogTitle>
+            <DialogDescription>
+              为数据表 <strong>{tableRemarkTarget}</strong> 添加中文备注，便于识别和展示。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-4">
+            <input
+              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+              placeholder="输入中文备注（如：销售订单表）"
+              value={tableRemarkValue}
+              onChange={(e) => setTableRemarkValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  (async () => {
+                    if (!tableRemarkTarget) return;
+                    try {
+                      await invoke("set_table_remark", {
+                        tableName: tableRemarkTarget,
+                        remark: tableRemarkValue.trim(),
+                      });
+                      setTableRemarks((prev) => ({
+                        ...prev,
+                        [tableRemarkTarget]: tableRemarkValue.trim(),
+                      }));
+                      setTableRemarkOpen(false);
+                      toast.success("表备注已保存");
+                    } catch (err) {
+                      toast.error(String(err));
+                    }
+                  })();
+                }
+              }}
+            />
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setTableRemarkOpen(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={async () => {
+                if (!tableRemarkTarget) return;
+                try {
+                  await invoke("set_table_remark", {
+                    tableName: tableRemarkTarget,
+                    remark: tableRemarkValue.trim(),
+                  });
+                  setTableRemarks((prev) => ({
+                    ...prev,
+                    [tableRemarkTarget]: tableRemarkValue.trim(),
+                  }));
+                  setTableRemarkOpen(false);
+                  toast.success("表备注已保存");
+                } catch (err) {
+                  toast.error(String(err));
+                }
+              }}
+            >
+              <Save className="mr-2 h-4 w-4" />
+              保存备注
             </Button>
           </DialogFooter>
         </DialogContent>

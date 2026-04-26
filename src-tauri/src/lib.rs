@@ -95,7 +95,7 @@ async fn parse_excel(path: String) -> Result<ParseExcelResult, String> {
             .headers()
             .map_err(|e| format!("CSV 解析失败: {}", e))?
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| sanitize_col(s))
             .collect::<Vec<_>>();
 
         let mut preview_data: Vec<Vec<String>> = vec![];
@@ -128,7 +128,7 @@ async fn parse_excel(path: String) -> Result<ParseExcelResult, String> {
                 .next()
                 .map(|r| {
                     r.iter()
-                        .map(|c| c.to_string().trim().to_string())
+                        .map(|c| sanitize_col(&c.to_string()))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -171,6 +171,14 @@ pub struct AiResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentPayload {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatMessagePayload {
     pub role: String,
     pub content: String,
@@ -178,10 +186,28 @@ pub struct ChatMessagePayload {
     pub timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub attachments: Option<Vec<AttachmentPayload>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TablePreviewPayload {
+    pub sheet_name: String,
+    pub columns: Vec<String>,
+    pub preview_data: Vec<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DbTablePreviewPayload {
+    pub table_name: String,
+    pub remark: String,
+    pub columns: Vec<String>,
+    pub preview_data: Vec<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatAttachmentPreviewPayload {
+    pub file_name: String,
     pub sheet_name: String,
     pub columns: Vec<String>,
     pub preview_data: Vec<Vec<String>>,
@@ -211,7 +237,7 @@ pub struct QueryResult {
 #[derive(Serialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -241,16 +267,22 @@ const SYSTEM_PROMPT: &str = r#"你是一位专业的数据分析助手。用户�
 必须严格遵守以下 JSON 格式（不要添加 markdown 代码块标记，直接返回 JSON 字符串）：
 {
   "ui_filters": [
-    {"id": "字段英文名", "label": "中文标签", "type": "input|select"}
+    {"id": "字段英文名", "label": "中文标签", "type": "input|select|multi_select|date_range|search", "options": ["选项1","选项2"], "default": "选项1", "target": ["col1","col2"]}
   ],
   "sql_template": "SELECT ... FROM temp_table WHERE 字段 = {{id}} ...",
-  "charts": ["pie", "bar", "table"]
+  "charts": ["pie", "bar", "line", "table"],
+  "actions": ["export_csv"],
+  "summary_cards": [{"title": "总销售额", "field": "amount", "agg": "sum"}]
 }
 
 说明：
 - sql_template 中的变量使用 {{id}} 双大括号占位，前端会替换为实际值。
 - 表名固定使用 temp_table。
+- ui_filters type 可选：input（文本）、select（单选下拉）、multi_select（多选复选框，值用逗号分隔）、date_range（日期范围，会在 SQL 中生成 {{id}}_start 和 {{id}}_end 两个变量）、search（模糊搜索）。
+- select / multi_select 的 options 从数据中该字段的去重值推断，也可不写options由前端自动生成。
 - charts 数组决定前端渲染哪些图表，可选 pie、bar、line、table。
+- actions 可选 export_csv、export_excel，前端会渲染对应导出按钮。
+- summary_cards 定义顶部统计卡片，agg 支持 sum、avg、count、max、min。
 - 仅返回 JSON，不要任何解释文字。
 "#;
 
@@ -266,13 +298,25 @@ const WORKBENCH_SYSTEM_PROMPT: &str = r#"你是一位数据入库与看板设计
 【强制规则 — 违反将导致系统无法执行】
 1. 当用户需要创建看板时，在回复的**最末尾**必须输出一段可执行的JSON。
 2. JSON格式**必须**严格如下（不要换行，不要markdown代码块，直接输出纯文本JSON）：
-{"action":"create_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT ...","ui_filters":[{"id":"字段名","label":"中文标签","type":"input|select"}],"charts":["pie","bar","table"],"source_table":"数据表名"}}
+{"action":"create_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT ...","ui_filters":[{"id":"字段名","label":"中文标签","type":"input|select|multi_select|date_range|search","options":["选项1","选项2"],"default":"选项1"}],"charts":["pie","bar","line","table"],"actions":["export_csv"],"summary_cards":[{"title":"总销售额","field":"amount","agg":"sum"}],"source_table":"数据表名"}}
 3. source_table 字段用于关联看板和数据库表，请填写 SQL 中实际查询的表名。
 4. 如果用户要求修改已有看板，输出格式必须是：
-{"action":"update_dashboard","dashboard":{"name":"...","sql_template":"...","ui_filters":[...],"charts":[...]}}
+{"action":"update_dashboard","dashboard":{"name":"...","sql_template":"...","ui_filters":[...],"charts":[...],"actions":[...],"summary_cards":[...]}}
 5. update_dashboard 中严禁包含 table_data 字段，table_data 由系统从数据库自动查询填充。
 6. 严禁使用markdown代码块（如 ```json）包裹JSON，系统只识别纯文本JSON。
 7. 只包含**需要设置/修改**的字段，不需要的字段**不要**出现在JSON中。
+
+【ui_filters 类型说明】
+- input: 普通文本输入框。
+- select: 单选下拉框，options 为该字段的去重值（可省略由前端自动生成）。
+- multi_select: 多选复选框，值用逗号分隔，SQL 中用 IN ({{id}}) 接收。
+- date_range: 日期范围，SQL 中会生成 {{id}}_start 和 {{id}}_end 两个变量，用 BETWEEN 接收。
+- search: 模糊搜索，SQL 中用 LIKE '%{{id}}%' 接收。
+
+【summary_cards 说明】
+- 用于在看板顶部显示聚合统计卡片。
+- agg 支持 sum、avg、count、max、min。
+- field 为 SQL 查询结果中的列名。
 
 【SQLite 语法 — 必须遵守，违反将直接导致看板报错】
 - 数据库是 SQLite，不是 MySQL。所有 sql_template 必须 SQLite 语法。
@@ -301,8 +345,27 @@ const THOUGHT_GUIDE_SYSTEM_PROMPT: &str = r#"# Role
 # Interaction Format (交互格式标准)
 请务必在有提问的回答里都写上下面中括号中的标题，不要漏掉。给出最终结果时不需要写。
 1. 【诊断反馈】：用一两句话幽默地总结一下你对当前需求的“体检报告”（比如觉得哪里太虚、哪里没兜底）。
-2. 【关键提问】：使用编号列表（1, 2, 3...）列出你的问题，最多5个。每个问题可以附带 A/B 选项引导用户思考。
+2. 【关键提问】：使用编号列表（1, 2, 3...）列出你的问题，最多5个。每个问题必须附带 A/B/C/D 选项（单行排列，如 A. 选项一 B. 选项二 C. 选项三），如果问题不适合出选项，也至少给出2个常见选项加“其它”。选项格式为：换行后 A. 选项内容、B. 选项内容……
 3. 【提醒】：提醒用户不要忘记回复你的问题。
+
+【绝对红线 — 违反将导致系统无法执行】
+- 累计提问轮次不得超过 3 轮。第 4 轮起必须直接输出 create_dashboard JSON，不再继续提问。
+- 如果用户已经提供了足够信息，立刻输出 JSON，不要继续追问。
+
+【create_dashboard JSON 格式 — 必须严格遵守，一字不差】
+当需要输出看板配置时，在回复最末尾输出纯文本 JSON（严禁 markdown 代码块），格式如下：
+{"action":"create_dashboard","dashboard":{"name":"看板名称","description":"描述","sql_template":"SELECT * FROM 表名 WHERE 条件","ui_filters":[{"field":"列名","label":"中文标签","type":"select|multi_select|date_range|input|search"}],"charts":["pie","bar","line","table"],"actions":["export_csv"],"summary_cards":[{"title":"总销售额","field":"amount","agg":"sum"}],"source_table":"数据库表名"}}
+
+字段说明：
+- name：看板名称（字符串，必填）。
+- sql_template：SQLite 查询语句（字符串，必填）。
+- ui_filters：筛选器配置数组（可选）。type 可选 input/select/multi_select/date_range/search。
+- charts：图表类型数组（字符串数组，可选）。每个元素只能是 "pie"/"bar"/"line"/"table" 之一，严禁使用对象或自定义类型如 "stacked_bar"。
+- actions：操作按钮数组（字符串数组，可选）。只能填 "export_csv" 或 "export_excel"。
+- summary_cards：顶部统计卡片数组（可选）。agg 支持 sum/avg/count/max/min。
+- source_table：数据库表名（字符串，必填），必须与 sql_template 中查询的表名一致。
+- 严禁在 dashboard 对象外使用 title、sheet_name、filters、calculated_fields、default_sort 等字段名。
+- 严禁输出 markdown 代码块（```json），只输出纯文本 JSON。
 "#;
 
 const MODIFICATION_SYSTEM_PROMPT: &str = r#"你是一位数据看板修改专家。用户正在修改一个已有的数据看板。
@@ -316,13 +379,20 @@ const MODIFICATION_SYSTEM_PROMPT: &str = r#"你是一位数据看板修改专家
 【强制规则 — 违反将导致系统无法执行】
 5. 分析用户修改需求后，在回复的最末尾必须输出一段可执行的JSON。
 6. JSON格式必须严格如下（不要换行，不要markdown代码块，直接输出纯文本JSON）：
-{"action":"update_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT ...","ui_filters":[{"id":"字段名","label":"中文标签","type":"input|select"}],"charts":["pie","bar","table"]}}
+{"action":"update_dashboard","dashboard":{"name":"看板名称","sql_template":"SELECT ...","ui_filters":[{"id":"字段名","label":"中文标签","type":"input|select|multi_select|date_range|search","options":["选项1","选项2"]}],"charts":["pie","bar","line","table"],"actions":["export_csv"],"summary_cards":[{"title":"总销售额","field":"amount","agg":"sum"}]}}
 7. 只包含用户明确要求修改的字段。未提及的字段绝对不要出现在JSON中。
 8. table_data 严禁出现在 update_dashboard 的JSON中。
 9. sql_template中的变量使用{{id}}双大括号占位。
 10. 如果用户只是闲聊或没有明确的修改需求，不要输出JSON，只回复文字即可。
 11. 严禁使用markdown代码块（如 ```json）包裹JSON，系统只识别纯文本JSON。
 12. 解释性文字可以放在JSON之前，但JSON必须放在整段回复的最后。
+
+【ui_filters 类型说明】
+- input: 普通文本输入框。
+- select: 单选下拉框。
+- multi_select: 多选复选框，值用逗号分隔，SQL 中用 IN ({{id}}) 接收。
+- date_range: 日期范围，SQL 中会生成 {{id}}_start 和 {{id}}_end 两个变量，用 BETWEEN 接收。
+- search: 模糊搜索，SQL 中用 LIKE '%{{id}}%' 接收。
 
 【SQLite 语法 — 必须遵守，违反将直接导致看板报错】
 - 数据库是 SQLite，不是 MySQL。所有 sql_template 必须 SQLite 语法。
@@ -379,11 +449,11 @@ async fn chat_with_ai(
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: system_content,
+                content: serde_json::Value::String(system_content),
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: user_content,
+                content: serde_json::Value::String(user_content),
             },
         ],
         temperature: 0.2,
@@ -432,6 +502,8 @@ async fn chat_workbench(
     app: tauri::AppHandle,
     messages: Vec<ChatMessagePayload>,
     table_preview: Option<TablePreviewPayload>,
+    db_table_previews: Option<Vec<DbTablePreviewPayload>>,
+    chat_attachment_previews: Option<Vec<ChatAttachmentPreviewPayload>>,
     thought_guide_mode: Option<bool>,
     modifying_dashboard: Option<bool>,
 ) -> Result<String, String> {
@@ -459,7 +531,7 @@ async fn chat_workbench(
         return Err("请先配置 AI 接口地址和 API Key".to_string());
     }
 
-    let system_content = if modifying_dashboard.unwrap_or(false) {
+    let mut system_content = if modifying_dashboard.unwrap_or(false) {
         println!("[chat_workbench] 使用【看板修改】系统提示词");
         MODIFICATION_SYSTEM_PROMPT.to_string()
     } else if thought_guide_mode.unwrap_or(true) {
@@ -470,9 +542,13 @@ async fn chat_workbench(
         WORKBENCH_SYSTEM_PROMPT.to_string()
     };
 
+    if db_table_previews.is_some() {
+        system_content.push_str("\n\n【数据库表查询能力】当前已提供数据库表结构和预览数据。如果你需要额外查询数据库来回答用户问题，可以在回复末尾附加 JSON: {\"action\":\"run_sql\",\"sql\":\"SELECT ...\"}（仅允许 SELECT）。系统会执行 SQL 并把结果返回给你，然后你再给出最终回答。");
+    }
+
     let mut chat_messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
-        content: system_content,
+        content: serde_json::Value::String(system_content),
     }];
 
     if let Some(preview) = table_preview {
@@ -484,24 +560,81 @@ async fn chat_workbench(
         .unwrap_or_default();
         chat_messages.push(ChatMessage {
             role: "system".to_string(),
-            content: format!("当前表格预览数据:\n{}", preview_json),
+            content: serde_json::Value::String(format!("当前表格预览数据:\n{}", preview_json)),
         });
         println!("[chat_workbench] 已注入表格预览数据到上下文");
     }
 
-    for (i, msg) in messages.iter().enumerate() {
-        println!("[chat_workbench] 消息[{}] role={} content_len={}", i, msg.role, msg.content.len());
+    if let Some(db_previews) = db_table_previews {
+        for p in &db_previews {
+            let preview_json = serde_json::to_string(&serde_json::json!({
+                "table_name": p.table_name,
+                "remark": p.remark,
+                "columns": p.columns,
+                "preview_data": p.preview_data,
+            })).unwrap_or_default();
+            chat_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: serde_json::Value::String(format!("数据库表 [{}] 预览数据:\n{}", p.table_name, preview_json)),
+            });
+        }
+        println!("[chat_workbench] 已注入 {} 张数据库表预览", db_previews.len());
+    }
+
+    if let Some(attach_previews) = chat_attachment_previews {
+        let mut attach_text = format!("用户在聊天中上传了 {} 张表格附件。当用户提到某个文件名或 Sheet 名时，请从下方对应附件中查找数据。\n", attach_previews.len());
+        for (i, p) in attach_previews.iter().enumerate() {
+            let preview_json = serde_json::to_string(&serde_json::json!({
+                "文件": p.file_name,
+                "sheet": p.sheet_name,
+                "列名": p.columns,
+                "前20行预览": p.preview_data,
+            })).unwrap_or_default();
+            attach_text.push_str(&format!("\n【聊天附件 {}】\n{}\n", i + 1, preview_json));
+        }
         chat_messages.push(ChatMessage {
-            role: msg.role.clone(),
-            content: msg.content.clone(),
+            role: "system".to_string(),
+            content: serde_json::Value::String(attach_text),
         });
+        println!("[chat_workbench] 已注入 {} 张聊天附件表格预览", attach_previews.len());
+    }
+
+    for (i, msg) in messages.iter().enumerate() {
+        println!("[chat_workbench] 消息[{}] role={} content_len={} attachments={}", i, msg.role, msg.content.len(), msg.attachments.as_ref().map(|a| a.len()).unwrap_or(0));
+        if let Some(attachments) = &msg.attachments {
+            let mut parts: Vec<serde_json::Value> = vec![];
+            if !msg.content.is_empty() {
+                parts.push(serde_json::json!({"type":"text","text":&msg.content}));
+            }
+            for att in attachments {
+                if att.mime_type.starts_with("image/") {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", att.mime_type, att.data)
+                        }
+                    }));
+                } else {
+                    parts.push(serde_json::json!({"type":"text","text":format!("【附件: {}】", att.filename)}));
+                }
+            }
+            chat_messages.push(ChatMessage {
+                role: msg.role.clone(),
+                content: serde_json::Value::Array(parts),
+            });
+        } else {
+            chat_messages.push(ChatMessage {
+                role: msg.role.clone(),
+                content: serde_json::Value::String(msg.content.clone()),
+            });
+        }
     }
 
     // 修改模式最终提醒：放在用户消息之后，最大程度影响AI输出
     if modifying_dashboard.unwrap_or(false) {
         chat_messages.push(ChatMessage {
             role: "system".to_string(),
-            content: "【最终提醒】你现在必须输出update_dashboard的JSON。只包含用户明确要求修改的字段，严禁碰table_data，严禁清空现有配置。JSON放在回复最后，不要markdown代码块。".to_string(),
+            content: serde_json::Value::String("【最终提醒】你现在必须输出update_dashboard的JSON。只包含用户明确要求修改的字段，严禁碰table_data，严禁清空现有配置。JSON放在回复最后，不要markdown代码块。".to_string()),
         });
         println!("[chat_workbench] 已注入修改模式最终提醒");
     }
@@ -682,8 +815,38 @@ fn init_db() -> Result<rusqlite::Connection, String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // 迁移：添加 source_table 列
-    let _ = conn.execute("ALTER TABLE dashboards ADD COLUMN source_table TEXT", []);
+    // 迁移：按需添加 dashboards 缺失列（先检查再添加，避免失败被静默忽略）
+    let mut existing_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(dashboards)").map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get("name")?;
+            Ok(name)
+        })
+        .map_err(|e| e.to_string())?;
+    for name in rows {
+        if let Ok(n) = name {
+            existing_cols.insert(n);
+        }
+    }
+    drop(stmt);
+
+    let needed_cols = vec![
+        ("source_table", "TEXT"),
+        ("actions", "TEXT"),
+        ("summary_cards", "TEXT"),
+        ("html_content", "TEXT"),
+    ];
+    for (col, typ) in needed_cols {
+        if !existing_cols.contains(col) {
+            let sql = format!("ALTER TABLE dashboards ADD COLUMN {} {}", col, typ);
+            if let Err(e) = conn.execute(&sql, []) {
+                eprintln!("[DB MIGRATE] 添加 dashboards.{} 失败: {}", col, e);
+            } else {
+                println!("[DB MIGRATE] 成功添加 dashboards.{} 列", col);
+            }
+        }
+    }
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS table_column_remarks (
@@ -702,6 +865,31 @@ fn init_db() -> Result<rusqlite::Connection, String> {
             table_name TEXT PRIMARY KEY,
             mappings TEXT NOT NULL DEFAULT '[]',
             auto_clean INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dashboard_id TEXT NOT NULL,
+            sql_template TEXT,
+            ui_filters TEXT,
+            charts TEXT,
+            actions TEXT,
+            summary_cards TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS table_remarks (
+            table_name TEXT PRIMARY KEY,
+            remark TEXT NOT NULL DEFAULT '',
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )",
         [],
@@ -842,6 +1030,9 @@ pub struct Dashboard {
     pub charts: Option<String>,
     pub table_data: Option<String>,
     pub source_table: Option<String>,
+    pub actions: Option<String>,
+    pub summary_cards: Option<String>,
+    pub html_content: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -855,13 +1046,16 @@ async fn create_dashboard(
     charts: Option<String>,
     table_data: Option<String>,
     source_table: Option<String>,
+    actions: Option<String>,
+    summary_cards: Option<String>,
+    html_content: Option<String>,
 ) -> Result<String, String> {
     let conn = init_db()?;
     let id = Uuid::new_v4().to_string();
 
     conn.execute(
-        "INSERT INTO dashboards (id, name, description, sql_template, ui_filters, charts, table_data, source_table) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![id, name, description, sql_template, ui_filters, charts, table_data, source_table],
+        "INSERT INTO dashboards (id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content],
     )
     .map_err(|e| e.to_string())?;
 
@@ -872,22 +1066,25 @@ async fn create_dashboard(
 async fn get_dashboards() -> Result<Vec<Dashboard>, String> {
     let conn = init_db()?;
     let mut stmt = conn
-        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, created_at, updated_at FROM dashboards ORDER BY updated_at DESC")
+        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at FROM dashboards ORDER BY updated_at DESC")
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
         .query_map([], |row| {
             Ok(Dashboard {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                sql_template: row.get(3)?,
-                ui_filters: row.get(4)?,
-                charts: row.get(5)?,
-                table_data: row.get(6)?,
-                source_table: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                id: row.get("id")?,
+                name: row.get("name")?,
+                description: row.get("description")?,
+                sql_template: row.get("sql_template")?,
+                ui_filters: row.get("ui_filters")?,
+                charts: row.get("charts")?,
+                table_data: row.get("table_data")?,
+                source_table: row.get("source_table")?,
+                actions: row.get("actions")?,
+                summary_cards: row.get("summary_cards")?,
+                html_content: row.get("html_content")?,
+                created_at: row.get("created_at")?,
+                updated_at: row.get("updated_at")?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -903,27 +1100,97 @@ async fn get_dashboards() -> Result<Vec<Dashboard>, String> {
 async fn get_dashboard(id: String) -> Result<Dashboard, String> {
     let conn = init_db()?;
     let mut stmt = conn
-        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, created_at, updated_at FROM dashboards WHERE id = ?1")
+        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at FROM dashboards WHERE id = ?1")
         .map_err(|e| e.to_string())?;
 
     let row = stmt
         .query_row([id], |row| {
             Ok(Dashboard {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                sql_template: row.get(3)?,
-                ui_filters: row.get(4)?,
-                charts: row.get(5)?,
-                table_data: row.get(6)?,
-                source_table: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                id: row.get("id")?,
+                name: row.get("name")?,
+                description: row.get("description")?,
+                sql_template: row.get("sql_template")?,
+                ui_filters: row.get("ui_filters")?,
+                charts: row.get("charts")?,
+                table_data: row.get("table_data")?,
+                source_table: row.get("source_table")?,
+                actions: row.get("actions")?,
+                summary_cards: row.get("summary_cards")?,
+                html_content: row.get("html_content")?,
+                created_at: row.get("created_at")?,
+                updated_at: row.get("updated_at")?,
             })
         })
         .map_err(|e| e.to_string())?;
 
     Ok(row)
+}
+
+#[tauri::command]
+async fn render_html_dashboard(dashboard_id: String) -> Result<String, String> {
+    let dashboard = get_dashboard(dashboard_id).await?;
+    let html_content = dashboard.html_content.ok_or("看板没有 HTML 内容")?;
+    let source_table = dashboard.source_table.ok_or("看板没有关联数据表")?;
+
+    // 1. 获取列备注（中文列名映射）
+    let remarks = get_column_remarks(source_table.clone())?;
+
+    // 2. 查询全量数据
+    let sql = format!(r#"SELECT * FROM "{}""#, source_table);
+    let query_result = run_sql_query(&sql)?;
+
+    // 3. 转换数据格式：英文列名 → 中文列名
+    let mut data: Vec<serde_json::Map<String, serde_json::Value>> = Vec::with_capacity(query_result.rows.len());
+    for row in &query_result.rows {
+        let mut obj = serde_json::Map::new();
+        for (i, col) in query_result.columns.iter().enumerate() {
+            let chinese_name = remarks.get(col).cloned().unwrap_or_else(|| col.clone());
+            let val = row.get(i).cloned().unwrap_or_default();
+            obj.insert(chinese_name, serde_json::Value::String(val));
+        }
+        data.push(obj);
+    }
+
+    // 4. 处理 HTML：注入 CSS + 数据 + 自动执行脚本
+    let mut html = html_content;
+
+    let hide_css = r#"<style>
+      .container > .card:first-of-type { display: none !important; }
+      #filterCard { display: block !important; }
+      #chartsCard { display: flex !important; }
+      #tableCard { display: block !important; }
+    </style>"#;
+    html = html.replace("</head>", &format!("{}</head>", hide_css));
+
+    let data_json = serde_json::to_string(&data).map_err(|e| e.to_string())?;
+    let data_script = format!(
+        r#"<script>
+          window.__dashboardData = {};
+          window.__anchorId = "IDNDS002";
+        </script>"#,
+        data_json
+    );
+    html = html.replace("<body>", &format!("<body>{}", data_script));
+
+    let auto_script = r#"<script>
+      (function() {
+        if (window.__dashboardData && window.__dashboardData.length > 0) {
+          if (typeof rawExcelData !== 'undefined') {
+            rawExcelData = window.__dashboardData;
+          } else {
+            window.rawExcelData = window.__dashboardData;
+          }
+          var anchorInput = document.getElementById('anchorId');
+          if (anchorInput) anchorInput.value = window.__anchorId || 'IDNDS002';
+          if (typeof runAnalysisLogic === 'function') {
+            runAnalysisLogic(window.__anchorId || 'IDNDS002');
+          }
+        }
+      })();
+    </script>"#;
+    html = html.replace("</body>", &format!("{}</body>", auto_script));
+
+    Ok(html)
 }
 
 #[tauri::command]
@@ -936,32 +1203,38 @@ async fn update_dashboard(
     charts: Option<String>,
     table_data: Option<String>,
     source_table: Option<String>,
+    actions: Option<String>,
+    summary_cards: Option<String>,
+    html_content: Option<String>,
 ) -> Result<(), String> {
     let conn = init_db()?;
 
     let current: Dashboard = conn.query_row(
-        "SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, created_at, updated_at FROM dashboards WHERE id = ?1",
+        "SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at FROM dashboards WHERE id = ?1",
         [&id],
         |row| Ok(Dashboard {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            description: row.get(2)?,
-            sql_template: row.get(3)?,
-            ui_filters: row.get(4)?,
-            charts: row.get(5)?,
-            table_data: row.get(6)?,
-            source_table: row.get(7)?,
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
+            id: row.get("id")?,
+            name: row.get("name")?,
+            description: row.get("description")?,
+            sql_template: row.get("sql_template")?,
+            ui_filters: row.get("ui_filters")?,
+            charts: row.get("charts")?,
+            table_data: row.get("table_data")?,
+            source_table: row.get("source_table")?,
+            actions: row.get("actions")?,
+            summary_cards: row.get("summary_cards")?,
+            html_content: row.get("html_content")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
         }),
     ).map_err(|e| e.to_string())?;
 
     // 安全更新：空字符串视为未修改，保留原有数据
-    let new_name = name.filter(|s| !s.is_empty()).unwrap_or(current.name);
-    let new_description = description.filter(|s| !s.is_empty()).or(current.description);
-    let new_sql = sql_template.filter(|s| !s.is_empty()).or(current.sql_template);
-    let new_filters = ui_filters.filter(|s| !s.is_empty() && s != "[]").or(current.ui_filters);
-    let new_charts = charts.filter(|s| !s.is_empty() && s != "[]").or(current.charts);
+    let new_name = name.filter(|s| !s.is_empty()).unwrap_or(current.name.clone());
+    let new_description = description.filter(|s| !s.is_empty()).or(current.description.clone());
+    let new_sql = sql_template.filter(|s| !s.is_empty()).or(current.sql_template.clone());
+    let new_filters = ui_filters.filter(|s| !s.is_empty() && s != "[]").or(current.ui_filters.clone());
+    let new_charts = charts.filter(|s| !s.is_empty() && s != "[]").or(current.charts.clone());
     // table_data 保护：只有传入非空且解析后多于1行（表头+数据）才更新
     let new_table_data = table_data.and_then(|s| {
         if s.is_empty() || s == "[]" { return None; }
@@ -969,22 +1242,108 @@ async fn update_dashboard(
             if arr.len() > 1 { return Some(s); }
         }
         None
-    }).or(current.table_data);
-    let new_source_table = source_table.filter(|s| !s.is_empty()).or(current.source_table);
+    }).or(current.table_data.clone());
+    let new_source_table = source_table.filter(|s| !s.is_empty()).or(current.source_table.clone());
+    let new_actions = actions.filter(|s| !s.is_empty() && s != "[]").or(current.actions.clone());
+    let new_summary_cards = summary_cards.filter(|s| !s.is_empty() && s != "[]").or(current.summary_cards.clone());
+    let new_html_content = html_content.filter(|s| !s.is_empty()).or(current.html_content.clone());
+
+    // 保存快照（只要任一关键字段发生变化）
+    let changed = new_sql.as_ref() != current.sql_template.as_ref()
+        || new_filters.as_ref() != current.ui_filters.as_ref()
+        || new_charts.as_ref() != current.charts.as_ref()
+        || new_actions.as_ref() != current.actions.as_ref()
+        || new_summary_cards.as_ref() != current.summary_cards.as_ref();
+    if changed {
+        conn.execute(
+            "INSERT INTO dashboard_revisions (dashboard_id, sql_template, ui_filters, charts, actions, summary_cards) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                id,
+                current.sql_template,
+                current.ui_filters,
+                current.charts,
+                current.actions,
+                current.summary_cards
+            ],
+        ).map_err(|e| e.to_string())?;
+    }
 
     conn.execute(
-        "UPDATE dashboards SET name = ?1, description = ?2, sql_template = ?3, ui_filters = ?4, charts = ?5, table_data = ?6, source_table = ?7, updated_at = CURRENT_TIMESTAMP WHERE id = ?8",
-        rusqlite::params![new_name, new_description, new_sql, new_filters, new_charts, new_table_data, new_source_table, id],
+        "UPDATE dashboards SET name = ?1, description = ?2, sql_template = ?3, ui_filters = ?4, charts = ?5, table_data = ?6, source_table = ?7, actions = ?8, summary_cards = ?9, html_content = ?10, updated_at = CURRENT_TIMESTAMP WHERE id = ?11",
+        rusqlite::params![new_name, new_description, new_sql, new_filters, new_charts, new_table_data, new_source_table, new_actions, new_summary_cards, new_html_content, id],
     ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn rollback_dashboard(id: String) -> Result<(), String> {
+    let conn = init_db()?;
+    let rev: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+        "SELECT sql_template, ui_filters, charts, actions, summary_cards FROM dashboard_revisions WHERE dashboard_id = ?1 ORDER BY id DESC LIMIT 1",
+        [&id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).map_err(|e| format!("没有可回退的快照: {}", e))?;
+    conn.execute(
+        "UPDATE dashboards SET sql_template = ?1, ui_filters = ?2, charts = ?3, actions = ?4, summary_cards = ?5, updated_at = CURRENT_TIMESTAMP WHERE id = ?6",
+        rusqlite::params![rev.0, rev.1, rev.2, rev.3, rev.4, &id],
+    ).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM dashboard_revisions WHERE dashboard_id = ?1 AND id = (SELECT MAX(id) FROM dashboard_revisions WHERE dashboard_id = ?1)", [&id])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 async fn delete_dashboard(id: String) -> Result<(), String> {
     let conn = init_db()?;
-    conn.execute("DELETE FROM dashboards WHERE id = ?1", [id])
+    conn.execute("DELETE FROM dashboards WHERE id = ?1", [&id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM dashboard_revisions WHERE dashboard_id = ?1", [&id])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn log_to_terminal(level: String, message: String) {
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    match level.as_str() {
+        "error" => eprintln!("[{}] [FRONTEND ERROR] {}", ts, message),
+        "warn" => println!("[{}] [FRONTEND WARN]  {}", ts, message),
+        _ => println!("[{}] [FRONTEND LOG]   {}", ts, message),
+    }
+}
+
+// 检查 SQL 是否为安全的 SELECT 查询（允许 CTE / 去除注释）
+fn is_safe_select(sql: &str) -> bool {
+    let mut cleaned = String::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\n' { break; }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else {
+            cleaned.push(c);
+        }
+    }
+    let t = cleaned.trim().to_lowercase();
+    t.starts_with("select") || t.starts_with("with")
+}
+
+#[tauri::command]
+fn run_sql_query_for_chat(sql: String) -> Result<QueryResult, String> {
+    if !is_safe_select(&sql) {
+        return Err("仅支持 SELECT 查询".to_string());
+    }
+    run_sql_query(&sql)
 }
 
 #[tauri::command]
@@ -999,8 +1358,7 @@ fn execute_dashboard_sql(
         }
     }
 
-    let trimmed = sql.trim().to_lowercase();
-    if !trimmed.starts_with("select") {
+    if !is_safe_select(&sql) {
         return Err("仅支持 SELECT 查询".to_string());
     }
 
@@ -1179,8 +1537,7 @@ async fn execute_dashboard_sql_with_repair(
         }
     }
 
-    let trimmed = sql.trim().to_lowercase();
-    if !trimmed.starts_with("select") {
+    if !is_safe_select(&sql) {
         return Err("仅支持 SELECT 查询".to_string());
     }
 
@@ -1273,7 +1630,7 @@ async fn execute_dashboard_sql_with_repair(
     let mut last_reason: Option<String> = None;
     let mut last_fix: Option<String> = None;
 
-    for round in 1..=3 {
+    for round in 1..=5 {
         step_num += 1;
         let s = RepairStep {
             step_number: step_num,
@@ -1302,7 +1659,7 @@ async fn execute_dashboard_sql_with_repair(
                 },
                 ChatMessage {
                     role: "user".into(),
-                    content: user_prompt,
+                    content: serde_json::Value::String(user_prompt),
                 },
             ],
             temperature: 0.1,
@@ -1581,7 +1938,7 @@ async fn modify_dashboard(
     let mut steps: Vec<ModifyStep> = vec![];
     let mut messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
-        content: MODIFICATION_SYSTEM_PROMPT.to_string(),
+        content: serde_json::Value::String(MODIFICATION_SYSTEM_PROMPT.to_string()),
     }];
 
     let initial_prompt = format!(
@@ -1594,7 +1951,7 @@ async fn modify_dashboard(
     );
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: initial_prompt,
+        content: serde_json::Value::String(initial_prompt),
     });
 
     let client = reqwest::Client::new();
@@ -1676,7 +2033,7 @@ async fn modify_dashboard(
         final_content = content.clone();
         messages.push(ChatMessage {
             role: "assistant".to_string(),
-            content: content.clone(),
+            content: serde_json::Value::String(content.clone()),
         });
 
         if content.contains("\"action\": \"update_dashboard\"") || content.contains("\"action\":\"update_dashboard\"") {
@@ -1694,7 +2051,7 @@ async fn modify_dashboard(
 
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: "请继续执行下一步。".to_string(),
+            content: serde_json::Value::String("请继续执行下一步。".to_string()),
         });
     }
 
@@ -1928,6 +2285,96 @@ fn set_column_remark(table_name: String, column_name: String, remark: String) ->
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn get_table_remark(table_name: String) -> Result<String, String> {
+    let conn = init_db()?;
+    let remark: String = conn.query_row(
+        "SELECT remark FROM table_remarks WHERE table_name = ?1",
+        [&table_name],
+        |row| row.get(0),
+    ).unwrap_or_default();
+    Ok(remark)
+}
+
+#[tauri::command]
+fn set_table_remark(table_name: String, remark: String) -> Result<(), String> {
+    let conn = init_db()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO table_remarks (table_name, remark, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
+        rusqlite::params![table_name, remark],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct ChatTableInfo {
+    pub table_name: String,
+    pub remark: String,
+    pub dashboards: Vec<String>,
+    pub column_count: i32,
+    pub row_count: i64,
+}
+
+#[tauri::command]
+fn list_db_tables_for_chat() -> Result<Vec<ChatTableInfo>, String> {
+    let conn = init_db()?;
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('dashboards','chat_sessions','table_column_remarks','table_upload_mappings','table_remarks','dashboard_revisions') ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    let mut dashboards_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut dash_stmt = conn
+        .prepare("SELECT source_table, name FROM dashboards WHERE source_table IS NOT NULL AND source_table != ''")
+        .map_err(|e| e.to_string())?;
+    let dash_rows = dash_stmt
+        .query_map([], |row| {
+            let tbl: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((tbl, name))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in dash_rows {
+        if let Ok((tbl, name)) = row {
+            dashboards_map.entry(tbl).or_default().push(name);
+        }
+    }
+    drop(dash_stmt);
+
+    let mut out = Vec::new();
+    for name in names {
+        let remark: String = conn.query_row(
+            "SELECT remark FROM table_remarks WHERE table_name = ?1",
+            [&name],
+            |row| row.get(0),
+        ).unwrap_or_default();
+        let col_count: i32 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{}')", name),
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        let row_count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM \"{}\"", name),
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        out.push(ChatTableInfo {
+            table_name: name.clone(),
+            remark,
+            dashboards: dashboards_map.get(&name).cloned().unwrap_or_default(),
+            column_count: col_count,
+            row_count,
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2381,8 +2828,21 @@ async fn ingest_full_data(
     emit_progress(&app, 70, "正在执行 SQL 清洗数据...".to_string(), error_rows);
 
     let cleaned_sql = clean_sql.replace("temp_table", &temp_table);
-    conn.execute_batch(&cleaned_sql)
-        .map_err(|e| format!("SQL 清洗失败: {}", e))?;
+    if let Err(e) = conn.execute_batch(&cleaned_sql) {
+        let actual_cols = columns.join(", ");
+        return Err(format!(
+            "SQL 清洗失败: {}。\n【诊断】temp_table({}) 的实际列名为: [{}]。\n请检查 AI 生成的 clean_sql 是否严格使用了上述列名，禁止改名或增减列。",
+            e, temp_table, actual_cols
+        ));
+    }
+
+    // 为前5列创建索引，加速后续条件查询
+    for col in columns.iter().take(5) {
+        let idx_name = format!("idx_{}_{}", table_name, col)
+            .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        let idx_sql = format!(r#"CREATE INDEX IF NOT EXISTS "{}" ON "{}" ("{}")"#, idx_name, table_name, col);
+        let _ = conn.execute(&idx_sql, []);
+    }
 
     emit_progress(&app, 85, "正在生成知识库摘要...".to_string(), error_rows);
 
@@ -2570,6 +3030,10 @@ clean_sql 是一段可被 SQLite execute_batch 执行的 SQL，必须包含两�
 1) CREATE TABLE 正式表名 (...);  — 字段类型可以是 TEXT/INTEGER/REAL，按列含义合理选择
 2) INSERT INTO 正式表名 SELECT [必要的 CAST/转换] FROM temp_table;
 注意：写 SQL 时使用字符串 "temp_table"，系统会自动替换。temp_table 中所有列都是 TEXT，需要时显式 CAST(col AS INTEGER) 之类的。
+
+【列名硬约束 — 必须遵守】
+- 下方文件预览中的 "columns" 列表就是 temp_table 的精确列名，clean_sql 的 SELECT 子句必须逐字使用这些列名，禁止改名、禁止增减列、禁止省略列。
+- 如果列名含中文或特殊符号，系统已自动转义为安全的 ASCII 标识符，你直接使用预览中给出的列名即可。
 
 【输出要求 — 必须严格遵守】
 返回纯 JSON 对象，不要 markdown 围栏：
@@ -2786,7 +3250,7 @@ async fn create_dashboard_from_template(
         "正在解析并压缩 HTML 模板",
         serde_json::Value::Null,
     );
-    let html_summary = compress_html_for_ai(html_content)?;
+    let html_summary = compress_html_for_ai(html_content.clone())?;
     if html_summary.len() > 8000 {
         warnings.push("HTML 摘要较长，AI 可能忽略部分细节".to_string());
     }
@@ -2843,7 +3307,7 @@ async fn create_dashboard_from_template(
 
         let existing_table_names_str = existing_tables.join(", ");
         let user_prompt = format!(
-            "【看板设计稿 HTML 摘要】\n{}\n\n【现有数据库表名（避免冲突）】\n{}\n\n【需要新建的数据文件预览】\n{}\n\n请按系统消息中的 JSON 格式返回建表方案。",
+            "【看板设计稿 HTML 摘要】\n{}\n\n【现有数据库表名（避免冲突）】\n{}\n\n【需要新建的数据文件预览】\n{}\n\n【重要提醒】\n每个文件预览里的 \"columns\" 就是 temp_table 的精确列名，你的 clean_sql 中 SELECT 子句必须一字不差地使用这些列名，禁止改名或增减列。请按系统消息中的 JSON 格式返回建表方案。",
             html_summary,
             existing_table_names_str,
             serde_json::to_string_pretty(&file_previews).unwrap_or_default()
@@ -2863,7 +3327,7 @@ async fn create_dashboard_from_template(
                         },
                         ChatMessage {
                             role: "user".into(),
-                            content: user_prompt.clone(),
+                            content: serde_json::Value::String(user_prompt.clone()),
                         },
                     ],
                     temperature: 0.1,
@@ -3014,7 +3478,7 @@ async fn create_dashboard_from_template(
                     },
                     ChatMessage {
                         role: "user".into(),
-                        content: user_content,
+                        content: serde_json::Value::String(user_content),
                     },
                 ],
                 temperature: 0.2,
@@ -3111,6 +3575,9 @@ async fn create_dashboard_from_template(
         charts,
         table_data,
         source_table,
+        None,
+        None,
+        Some(html_content.clone()),
     )
     .await?;
 
@@ -3158,6 +3625,7 @@ pub fn run() {
             ingest_full_data,
             search_kb,
             get_db_tables,
+            list_db_tables_for_chat,
             get_table_schema,
             query_table_data,
             drop_user_table,
@@ -3175,6 +3643,7 @@ pub fn run() {
             update_dashboard,
             delete_dashboard,
             execute_dashboard_sql,
+            run_sql_query_for_chat,
             execute_dashboard_sql_with_repair,
             modify_dashboard,
             get_local_db_path,
@@ -3185,11 +3654,16 @@ pub fn run() {
             get_table_primary_key,
             get_column_remarks,
             set_column_remark,
+            get_table_remark,
+            set_table_remark,
             get_table_mappings,
             save_table_mappings,
             compress_html_for_ai,
             create_dashboard_from_template,
             rollback_created_tables,
+            rollback_dashboard,
+            log_to_terminal,
+            render_html_dashboard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
