@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { ArrowUp, Square, Paperclip, X, FileText, FileSpreadsheet } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
@@ -53,6 +53,31 @@ export default function InputArea({
   const [isDragging, setIsDragging] = useState(false);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // 全局粘贴监听：无论焦点在哪个输入框，只要剪贴板里有文件就捕获到附件
+  useEffect(() => {
+    const handleDocPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const pastedFiles: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].kind === "file") {
+          const file = items[i].getAsFile();
+          if (file) pastedFiles.push(file);
+        }
+      }
+      if (pastedFiles.length > 0) {
+        e.preventDefault();
+        const dt = new DataTransfer();
+        pastedFiles.forEach((f) => dt.items.add(f));
+        handleFiles(dt.files);
+        // 聚焦回主输入框，方便用户继续打字
+        textareaRef.current?.focus();
+      }
+    };
+    document.addEventListener("paste", handleDocPaste);
+    return () => document.removeEventListener("paste", handleDocPaste);
+  }, []);
 
   const adjustHeight = useCallback(() => {
     const el = textareaRef.current;
@@ -115,8 +140,12 @@ export default function InputArea({
     if (!fileList) return;
     const newFiles: Attachment[] = Array.from(fileList).map((file) => {
       const ext = getExtension(file.name);
+      // Tauri webview 拖拽文件时会携带本地绝对路径
+      // @ts-expect-error tauri specific path property
+      const path = file.path as string | undefined;
       return {
         file,
+        path,
         previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined,
         displayName: file.name,
         isTable: TABLE_EXTENSIONS.includes(ext),
@@ -139,23 +168,6 @@ export default function InputArea({
     e.preventDefault();
     setIsDragging(false);
     handleFiles(e.dataTransfer.files);
-  };
-
-  const handlePaste = (e: React.ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const pastedFiles: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].kind === "file") {
-        const file = items[i].getAsFile();
-        if (file) pastedFiles.push(file);
-      }
-    }
-    if (pastedFiles.length > 0) {
-      const dt = new DataTransfer();
-      pastedFiles.forEach((f) => dt.items.add(f));
-      handleFiles(dt.files);
-    }
   };
 
   const removeFile = (index: number) => {
@@ -267,7 +279,6 @@ export default function InputArea({
               value={value}
               onChange={handleChange}
               onKeyDown={handleKeyDown}
-              onPaste={handlePaste}
               placeholder="问点什么... (Enter 换行, Cmd/Ctrl + Enter 发送)"
               className="w-full min-h-[60px] max-h-[200px] px-3 py-2 bg-transparent resize-none outline-none text-sm"
               disabled={loading}

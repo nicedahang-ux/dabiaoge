@@ -1,6 +1,6 @@
 [package]
 name = "ai-excel-kanban"
-version = "0.2.0"
+version = "1.0.0"
 description = "AI表格转看板"
 authors = ["you"]
 edition = "2021"

@@ -183,7 +183,8 @@ fn inject_html_with_data(
 
     let auto_script = r#"<script>
       (function() {
-        if (window.__dashboardData && window.__dashboardData.length > 0) {
+        function applyDashboardData() {
+          if (!window.__dashboardData || window.__dashboardData.length === 0) return false;
           if (typeof rawExcelData !== 'undefined') {
             rawExcelData = window.__dashboardData;
           } else {
@@ -192,8 +193,23 @@ fn inject_html_with_data(
           var anchorInput = document.getElementById('anchorId');
           if (anchorInput) anchorInput.value = window.__anchorId || 'IDNDS002';
           if (typeof runAnalysisLogic === 'function') {
-            runAnalysisLogic(window.__anchorId || 'IDNDS002');
+            try { runAnalysisLogic(window.__anchorId || 'IDNDS002'); } catch (e) { console.error('[share] runAnalysisLogic error', e); }
+            return true;
           }
+          return false;
+        }
+        function trigger() {
+          if (applyDashboardData()) return;
+          var attempts = 0;
+          var timer = setInterval(function() {
+            attempts++;
+            if (applyDashboardData() || attempts > 80) clearInterval(timer);
+          }, 100);
+        }
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', trigger);
+        } else {
+          trigger();
         }
       })();
     </script>"#;

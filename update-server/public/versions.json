@@ -1,5 +1,11 @@
 [
   {
+    "version": "1.0.0",
+    "date": "2026-04-26",
+    "notes": "优化生成HTML问题和看板复制功能",
+    "filename": "AI表格转看板_1.0.0_x64-setup.nsis.zip"
+  },  
+  {
     "version": "0.2.1",
     "date": "2026-04-26",
     "notes": "优化html生成功能",

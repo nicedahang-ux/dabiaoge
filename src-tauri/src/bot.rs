@@ -31,8 +31,8 @@ const BOT_SYSTEM_PROMPT: &str = r#"你是企业数据助手"小妮"，专门帮�
 
 工作流：
 1. 分析用户问题，判断是否需要查询数据库。
-2. 如果需要，生成合法的 SQLite SQL。
-3. 调用 query_sql 获取结果。
+2. 如果我在上下文中已经给了你看板明细数据（前 20 行预览），并且这些数据已经能回答用户问题，请直接引用这些数据作答，不要调用 query_sql。
+3. 只有看板明细中确实找不到答案时，才生成 SQL 去原始表里查询。
 4. 根据结果友好回复用户。如果查无数据，请说："小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？"
 
 回复风格要求（非常重要）：
@@ -43,9 +43,11 @@ const BOT_SYSTEM_PROMPT: &str = r#"你是企业数据助手"小妮"，专门帮�
 - 如果某个表关联了数据看板，主动告诉用户："这个问题在看板《XXX》里也能看到可视化图表哦~"
 - 保持语气亲切、活泼，适当加 emoji。
 
-看板优先规则：
-- 如果用户问题明显与某个数据看板相关（例如问到了看板里的款号、编码、销售额、搭配等），请优先查询该看板关联的数据表来回答。
-- 查询不到时，再查其他表。
+看板优先规则（绝对优先）：
+- 如果用户问题提到了具体的款号、编码、SKU、店铺名等，并且我在上下文中已经提供了该看板的明细数据（table_data 预览），请直接引用这些现成数据回答。
+- 看板明细数据是已经计算/汇总好的结果，比去原始表里重新查询更准确、更完整。
+- 严禁在看板预览明明有数据的情况下，还说"数据库里没有记录"。
+- 只有当看板预览中确实找不到相关记录时，才去原始表查询。
 
 举例：
 - 不要这样说："表 sales 包含 quantity 字段，使用 SELECT SUM..."
@@ -761,6 +763,64 @@ async fn handle_message(
     // 反向模糊查询：让 AI 抽取候选关键词，去原始表里 LIKE 探查，命中的表反查关联看板
     let kw_client = reqwest::Client::new();
     let keywords = extract_search_keywords(&kw_client, config, content).await;
+
+    // 在看板 table_data 中直接搜索匹配关键词的行（现成计算数据优先）
+    let mut direct_hit_section = String::new();
+    if !keywords.is_empty() {
+        let mut direct_hits: Vec<(String, Vec<serde_json::Map<String, serde_json::Value>>)> = vec![];
+        for d in &dashboards {
+            if d.table_data.trim().is_empty() {
+                continue;
+            }
+            let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+                match serde_json::from_str(&d.table_data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+            let mut matched_rows = vec![];
+            for row in &rows {
+                let row_text = row.values().map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => v.to_string(),
+                }).collect::<Vec<String>>().join(" ");
+                let row_lower = row_text.to_lowercase();
+                for kw in &keywords {
+                    if row_lower.contains(&kw.to_lowercase()) {
+                        matched_rows.push(row.clone());
+                        break;
+                    }
+                }
+            }
+            if !matched_rows.is_empty() {
+                direct_hits.push((d.name.clone(), matched_rows));
+            }
+        }
+        if !direct_hits.is_empty() {
+            let mut buf = String::from("🎯【看板直接命中】用户提到的关键词在看板明细数据中已有完整记录，请直接根据以下数据回答，禁止再去原始表里查询！\n\n");
+            for (board_name, rows) in &direct_hits {
+                buf.push_str(&format!("看板《{}》匹配数据：\n", board_name));
+                if let Some(first_row) = rows.first() {
+                    let cols: Vec<String> = first_row.keys().cloned().collect();
+                    let mut lines = vec![cols.join(" | ")];
+                    for row in rows.iter().take(20) {
+                        let vals: Vec<String> = cols.iter().map(|c| match row.get(c) {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Number(n)) => n.to_string(),
+                            Some(serde_json::Value::Bool(b)) => b.to_string(),
+                            Some(serde_json::Value::Null) | None => String::new(),
+                            Some(other) => other.to_string(),
+                        }).collect();
+                        lines.push(vals.join(" | "));
+                    }
+                    buf.push_str(&lines.join("\n"));
+                    buf.push_str("\n\n");
+                }
+            }
+            direct_hit_section = buf;
+        }
+    }
+
     let mut fuzzy_section = String::new();
     if !keywords.is_empty() {
         let hits = reverse_fuzzy_search(&conn, &keywords, 12);
@@ -799,6 +859,9 @@ async fn handle_message(
 
     let kb_hint = {
         let mut parts: Vec<String> = vec![];
+        if !direct_hit_section.is_empty() {
+            parts.push(direct_hit_section.clone());
+        }
         if !kb.is_empty() {
             parts.push(format!("相关数据表信息:\n{}", kb.join("\n")));
         }
@@ -826,6 +889,13 @@ async fn handle_message(
     let url = format!("{}/chat/completions", config.ai_url.trim_end_matches('/'));
     let query_model_str = resolve_query_model(config);
     let mut query_messages = messages.clone();
+    // 如果看板直接命中数据已存在，给查询模型加一条强指令，避免它再去原始表查空结果
+    if !direct_hit_section.is_empty() {
+        query_messages.push(json!({
+            "role": "system",
+            "content": "【指令】上面的 🎯【看板直接命中】已经包含了用户问题的完整数据，请直接分析这些数据并总结回复，绝对不要调用 query_sql 去原始表里查询。"
+        }));
+    }
     let mut query_history: Vec<String> = vec![];
     let mut query_rounds = 10;
 
@@ -917,7 +987,8 @@ async fn handle_message(
 3. 主动告诉用户："这个问题在看板里也能看到可视化图表哦~"
 4. 可以建议生成哪些图表（如饼图、柱状图、折线图）来更直观展示数据
 5. 保持语气亲切、活泼，适当加 emoji
-6. 如果查无数据，请说："小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？""#,
+6. 如果查无数据，请说："小妮查了一下，数据库里好像没有找到相关记录哦，要不检查一下款号对不对？"
+7. 如果前面的上下文中已经提供了看板直接命中的明细数据（🎯【看板直接命中】），请直接引用这些数据生成回复，不要再说"数据库里没有记录"。"#,
         content
     );
 

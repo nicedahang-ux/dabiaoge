@@ -82,6 +82,10 @@ export default function AIChat({
   const [dbSelectOpen, setDbSelectOpen] = useState(false);
   const [dbTablePreviews, setDbTablePreviews] = useState<DbTablePreview[]>([]);
   const [tableDropdownOpen, setTableDropdownOpen] = useState(false);
+  // 已处理（去重/预入库）过的文件路径，避免重复弹窗
+  const [resolvedFilePaths, setResolvedFilePaths] = useState<Set<string>>(new Set());
+  // 工作台文件 -> 入库表名映射，用于移除时同步清理 dbTablePreviews
+  const [fileToTableMap, setFileToTableMap] = useState<Record<string, string>>({});
   const [duplicateModal, setDuplicateModal] = useState<{
     open: boolean;
     tableName: string;
@@ -312,6 +316,8 @@ export default function AIChat({
       setParsingFile(true);
       const loadedPreviews: TablePreviewPayload[] = [];
       const loadedPaths: string[] = [];
+      const newDbPreviews: DbTablePreview[] = [];
+      const newFileToTable: Record<string, string> = {};
       let firstDup: { tableName: string; remark: string; filePath: string; preview: TablePreviewPayload } | null = null;
 
       try {
@@ -332,19 +338,27 @@ export default function AIChat({
               }
               continue;
             }
+            // 预入库到数据库
+            const dbPreview = await invoke<DbTablePreview>("quick_ingest_file", { filePath: path });
+            newDbPreviews.push(dbPreview);
+            newFileToTable[path] = dbPreview.table_name;
             loadedPreviews.push(preview);
             loadedPaths.push(path);
             toast.success(
-              `已加载表格: ${preview.sheet_name}（${preview.columns.length} 列, 预览 ${preview.preview_data.length} 行）`
+              `已入库: ${dbPreview.table_name}（${dbPreview.columns.length} 列）`
             );
           } catch (e) {
-            toast.error(`解析表格失败(${path.split(/[\\/]/).pop() || path}): ` + String(e));
+            toast.error(`表格入库失败(${path.split(/[\\/]/).pop() || path}): ` + String(e));
           }
         }
 
         if (loadedPreviews.length > 0) {
           setFilePaths((prev) => [...prev, ...loadedPaths]);
           setFilePreviews((prev) => [...prev, ...loadedPreviews]);
+        }
+        if (newDbPreviews.length > 0) {
+          setDbTablePreviews((prev) => [...prev, ...newDbPreviews]);
+          setFileToTableMap((prev) => ({ ...prev, ...newFileToTable }));
         }
 
         if (firstDup) {
@@ -367,12 +381,25 @@ export default function AIChat({
   };
 
   const handleClearTable = () => {
+    const tablesToRemove = filePaths.map((fp) => fileToTableMap[fp]).filter(Boolean);
+    setDbTablePreviews((prev) => prev.filter((p) => !tablesToRemove.includes(p.table_name)));
+    setFileToTableMap({});
     setFilePreviews([]);
     setFilePaths([]);
     setTableDropdownOpen(false);
   };
 
   const handleRemoveTable = (index: number) => {
+    const removedPath = filePaths[index];
+    const tableName = removedPath ? fileToTableMap[removedPath] : undefined;
+    if (tableName) {
+      setDbTablePreviews((prev) => prev.filter((p) => p.table_name !== tableName));
+      setFileToTableMap((prev) => {
+        const next = { ...prev };
+        delete next[removedPath];
+        return next;
+      });
+    }
     setFilePreviews((prev) => {
       const next = prev.filter((_, i) => i !== index);
       if (next.length === 0) setTableDropdownOpen(false);
@@ -471,6 +498,7 @@ export default function AIChat({
         column_remarks: columnRemarks || {},
       };
       setDbTablePreviews((prev) => [...prev, preview]);
+      setResolvedFilePaths((prev) => new Set(prev).add(duplicateModal.filePath));
       setDuplicateModal((prev) => ({ ...prev, open: false }));
       toast.success(`已选择数据表: ${tableName}`);
     } catch (e) {
@@ -478,13 +506,19 @@ export default function AIChat({
     }
   };
 
-  const handleRenameCreate = () => {
+  const handleRenameCreate = async () => {
     if (!duplicateModal.preview) return;
-    const preview = duplicateModal.preview;
-    setFilePaths((prev) => [...prev, duplicateModal.filePath]);
-    setFilePreviews((prev) => [...prev, preview]);
-    setDuplicateModal((prev) => ({ ...prev, open: false }));
-    toast.info("将自动重命名创建新数据表，避免覆盖原有数据");
+    try {
+      const dbPreview = await invoke<DbTablePreview>("quick_ingest_file", {
+        filePath: duplicateModal.filePath,
+      });
+      setDbTablePreviews((prev) => [...prev, dbPreview]);
+      setResolvedFilePaths((prev) => new Set(prev).add(duplicateModal.filePath));
+      setDuplicateModal((prev) => ({ ...prev, open: false }));
+      toast.success(`已重命名入库: ${dbPreview.table_name}`);
+    } catch (e) {
+      toast.error("重命名入库失败: " + String(e));
+    }
   };
 
   // 清洗 AI 返回内容，去除重复的诊断反馈段落
@@ -557,10 +591,16 @@ export default function AIChat({
 
     let appendedNote = "";
     const allTablePreviews: ChatTablePreview[] = [];
+    const ingestedChatTables: DbTablePreview[] = []; // 本轮预入库的聊天附件表
 
-    // 表格附件：遍历所有表格做 20 行预览
+    // 表格附件：先检测重复，再直接预入库到数据库
+    // 已处理（去重/预入库）过的路径不再重复检测
     const tableAttachments = files.filter(
-      (f) => f.isTable && !!f.path && TABLE_EXTS.includes(((f.path || "").split(".").pop() || "").toLowerCase())
+      (f) =>
+        f.isTable &&
+        !!f.path &&
+        TABLE_EXTS.includes(((f.path || "").split(".").pop() || "").toLowerCase()) &&
+        !resolvedFilePaths.has(f.path)
     );
     if (tableAttachments.length > 0) {
       setParsingFile(true);
@@ -581,21 +621,28 @@ export default function AIChat({
               });
               return; // 中断发送，等待用户选择
             }
+            // 预入库：直接写入数据库，后续对话和建表都走现有表路径
+            const dbPreview = await invoke<DbTablePreview>("quick_ingest_file", {
+              filePath: ta.path!,
+            });
+            ingestedChatTables.push(dbPreview);
+            setDbTablePreviews((prev) => [...prev, dbPreview]);
+            toast.success(`表格已入库: ${dbPreview.table_name}`);
             allTablePreviews.push({
               file_name: ta.path!.split(/[\\/]/).pop() ?? ta.path!,
-              sheet_name: preview.sheet_name,
-              columns: preview.columns,
-              preview_data: preview.preview_data,
+              sheet_name: "",
+              columns: dbPreview.columns,
+              preview_data: dbPreview.preview_data,
             });
           }
         } catch (e) {
-          toast.error(`解析表格附件失败(${ta.displayName}): ` + String(e));
+          toast.error(`表格入库失败(${ta.displayName}): ` + String(e));
         }
       }
       setParsingFile(false);
       if (allTablePreviews.length > 0) {
         toast.success(
-          `表格附件已处理: 共 ${allTablePreviews.length} 份表格（各取前 20 行送 AI）`
+          `表格附件已处理: 共 ${allTablePreviews.length} 份表格（已直接入库）`
         );
       }
     }
@@ -683,15 +730,24 @@ export default function AIChat({
         )
       );
 
-      let history: { role: string; content: string }[] = newMessages.map((m) => ({ role: m.role, content: m.content }));
+      let history: { role: string; content: string; attachments?: { filename: string; mimeType: string; data: string }[] }[] = newMessages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        attachments: m.attachments,
+      }));
       if (dashboardContext) {
         history = [{ role: "system", content: dashboardContext }, ...history];
       }
 
+      const mergedDbPreviews =
+        dbTablePreviews.length > 0 || ingestedChatTables.length > 0
+          ? [...dbTablePreviews, ...ingestedChatTables]
+          : null;
+
       const res = await invoke<string>("chat_workbench", {
         messages: history,
         tablePreview: filePreviews.length > 0 ? filePreviews : null,
-        dbTablePreviews: dbTablePreviews.length > 0 ? dbTablePreviews : null,
+        dbTablePreviews: mergedDbPreviews,
         chatAttachmentPreviews: allTablePreviews.length > 0 ? allTablePreviews : null,
         thoughtGuideMode,
         modifyingDashboard: !!dashboardTag,
@@ -710,7 +766,11 @@ export default function AIChat({
       const html = extractHtmlBlock(res);
       let displayContent: string;
 
-      if (html) {
+      // Q&A 闸门：当 AI 回复包含【关键提问】/【诊断反馈】/【提醒】等思考引导标记时，
+      // 视为澄清/追问轮，即使 AI 误塞了 HTML 代码块也不触发看板创建。
+      const isQATurn = /【(关键提问|诊断反馈|提醒)】/.test(res);
+
+      if (html && !isQATurn) {
         const mode: "create" | "modify" = dashboardTag ? "modify" : "create";
         displayContent = stripHtmlBlockForBubble(res, mode);
         setHtmlBuildActive(true);
@@ -732,45 +792,14 @@ export default function AIChat({
             setModifyingState({ status: "success", dashboardId: dashboardTag });
             refreshDashboards();
           } else {
-            // 创建模式：把当前预览的单文件 + 聊天附件表格 → NewFileSpec[]
-            const newFiles: { file_path: string; target_table_name: string }[] = [];
-            const seen = new Set<string>();
-            const toTargetName = (p: string, idx: number): string => {
-              const fname = p.split(/[\\/]/).pop() || `file_${idx}`;
-              const baseName = fname.replace(/\.(xlsx|xls|csv)$/i, "");
-              return baseName.toLowerCase().replace(/[^a-z0-9_]/g, "_") || `t_data_${idx}`;
-            };
+            // 工作台文件和聊天附件都已预入库到 dbTablePreviews，
+            // 直接走 existingTables 路径，无需再构建 newFiles。
+            const existingTables = [
+              ...dbTablePreviews.map((p) => p.table_name),
+              ...ingestedChatTables.map((p) => p.table_name),
+            ];
 
-            // 获取所有数据库表名，用于自动重命名避免覆盖
-            const allDbTables = await invoke<string[]>("get_db_tables");
-            const ensureUniqueName = (base: string): string => {
-              if (!allDbTables.includes(base)) return base;
-              let idx = 2;
-              while (allDbTables.includes(`${base}_${idx}`)) {
-                idx++;
-              }
-              return `${base}_${idx}`;
-            };
-
-            for (const fp of filePaths) {
-              if (seen.has(fp)) continue;
-              newFiles.push({
-                file_path: fp,
-                target_table_name: ensureUniqueName(toTargetName(fp, newFiles.length)),
-              });
-              seen.add(fp);
-            }
-            for (const ta of tableAttachments) {
-              if (!ta.path || seen.has(ta.path)) continue;
-              newFiles.push({
-                file_path: ta.path,
-                target_table_name: ensureUniqueName(toTargetName(ta.path, newFiles.length)),
-              });
-              seen.add(ta.path);
-            }
-            const existingTables = dbTablePreviews.map((p) => p.table_name);
-
-            if (newFiles.length === 0 && existingTables.length === 0) {
+            if (existingTables.length === 0) {
               throw new Error("缺少数据来源：请在工作台先选择数据库表或上传表格");
             }
 
@@ -787,6 +816,7 @@ export default function AIChat({
               if (cleanText) dashboardName = cleanText + "看板";
             }
 
+            const newFiles: { file_path: string; target_table_name: string }[] = [];
             const result = await invoke<CreateDashboardResult>("create_dashboard_from_ai_html", {
               htmlContent: html,
               newFiles,
@@ -807,7 +837,11 @@ export default function AIChat({
         }
       } else {
         // 没有 HTML 代码块 → 普通对话（追问 / 闲聊）
-        displayContent = sanitizeAssistantContent(res) || res;
+        // 或者 Q&A 闸门拦截：即使 AI 误塞了 HTML，也按问答轮显示，去掉代码块
+        const stripped = html
+          ? stripHtmlBlockForBubble(res, dashboardTag ? "modify" : "create")
+          : res;
+        displayContent = sanitizeAssistantContent(stripped) || stripped;
       }
 
       const currentMessages = newMessages;
@@ -850,6 +884,7 @@ export default function AIChat({
     if (!targetMsg) return;
 
     setSubmittedMessageIds((prev) => new Set(prev).add(targetMsg.id));
+    setInput(""); // 提交时清空底部输入框
     await handleSend(formattedText, []);
   };
 
@@ -1004,6 +1039,7 @@ export default function AIChat({
                   isSubmitted={submittedMessageIds.has(msg.id)}
                   onSubmitAnswers={handleThoughtSubmit}
                   isLatestAssistant={msg.id === latestAssistantId}
+                  supplementText={input}
                 />
               </div>
             ))}

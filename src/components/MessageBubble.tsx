@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { User, Bot, CheckCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
 import { parseThoughtQuestions, formatThoughtSubmission } from "@/lib/thoughtGuideQuestions";
 import type { ChatMessage } from "@/lib/AppContext";
 
@@ -11,6 +12,7 @@ interface MessageBubbleProps {
   isSubmitted: boolean;
   onSubmitAnswers: (formattedText: string) => void;
   isLatestAssistant: boolean;
+  supplementText?: string;
 }
 
 export default function MessageBubble({
@@ -19,6 +21,7 @@ export default function MessageBubble({
   isSubmitted,
   onSubmitAnswers,
   isLatestAssistant,
+  supplementText = "",
 }: MessageBubbleProps) {
   const [answers, setAnswers] = useState<string[]>([]);
   const [selectedOptions, setSelectedOptions] = useState<Record<number, string>>({});
@@ -67,7 +70,19 @@ export default function MessageBubble({
   };
 
   const handleSubmit = () => {
-    const formatted = formatThoughtSubmission(answers, "");
+    // 校验：所有带选项的问题必须做出选择；开放问题必须填写内容
+    const unansweredIdx = questions?.findIndex((q, idx) => {
+      if (q.options && q.options.length > 0) {
+        return !selectedOptions[idx];
+      }
+      return !(answers[idx] || "").trim();
+    });
+    if (unansweredIdx !== undefined && unansweredIdx >= 0) {
+      toast.error(`问题 ${unansweredIdx + 1} 还没有回答，请先选择或填写答案`);
+      return;
+    }
+
+    const formatted = formatThoughtSubmission(answers, supplementText);
     if (formatted) {
       onSubmitAnswers(formatted);
     }

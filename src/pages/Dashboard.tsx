@@ -427,6 +427,28 @@ export default function DashboardPage() {
     }
   };
 
+  const handleCopyDashboard = async (dashboard: Dashboard) => {
+    try {
+      const newId = await invoke<string>("create_dashboard", {
+        name: `${dashboard.name} 复制`,
+        description: dashboard.description ?? null,
+        sqlTemplate: dashboard.sql_template ?? null,
+        uiFilters: dashboard.ui_filters ?? null,
+        charts: dashboard.charts ?? null,
+        tableData: dashboard.table_data ?? null,
+        sourceTable: dashboard.source_table ?? null,
+        actions: dashboard.actions ?? null,
+        summaryCards: dashboard.summary_cards ?? null,
+        htmlContent: dashboard.html_content ?? null,
+      });
+      toast.success("看板已复制");
+      await refreshDashboards();
+      setBoardsSelectedId(newId);
+    } catch (e) {
+      toast.error("复制失败: " + String(e));
+    }
+  };
+
   const handleImportDashboard = async () => {
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -820,6 +842,7 @@ export default function DashboardPage() {
                 onView={handleViewDashboard}
                 onModify={handleModifyDashboard}
                 onPack={handlePackDashboard}
+                onCopy={handleCopyDashboard}
                 onDelete={(d) => {
                   setDeletingDashboard(d);
                   setDeleteMode("dashboard");

@@ -147,20 +147,21 @@ function ShareButton() {
 function MainLayout() {
   const { activeView, switchView, botStatus } = useApp();
 
-  useEffect(() => {
-    async function autoStartBot() {
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        const config = await invoke<{ ding_app_key?: string; ding_app_secret?: string }>("load_config");
-        if (config.ding_app_key && config.ding_app_secret) {
-          await invoke("start_bot");
-        }
-      } catch {
-        // 静默失败，不打扰用户
-      }
-    }
-    autoStartBot();
-  }, []);
+  // 注：不再自动启动钉钉监听，用户需手动在「系统配置」中点击「启动」
+  // useEffect(() => {
+  //   async function autoStartBot() {
+  //     try {
+  //       const { invoke } = await import("@tauri-apps/api/core");
+  //       const config = await invoke<{ ding_app_key?: string; ding_app_secret?: string }>("load_config");
+  //       if (config.ding_app_key && config.ding_app_secret) {
+  //         await invoke("start_bot");
+  //       }
+  //     } catch {
+  //       // 静默失败，不打扰用户
+  //     }
+  //   }
+  //   autoStartBot();
+  // }, []);
 
   // 轮询检测外部Python入库后的刷新信号
   useEffect(() => {

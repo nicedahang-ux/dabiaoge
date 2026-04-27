@@ -41,6 +41,7 @@ export default function SharePage() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [boardData, setBoardData] = useState<BoardData | null>(null);
+  const [iframeLoading, setIframeLoading] = useState(true);
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const clearToken = () => {
@@ -180,7 +181,6 @@ export default function SharePage() {
   } catch {
     // ignore
   }
-
   const chartData = tableData.length > 0
     ? (() => {
         const firstRow = tableData[0];
@@ -251,9 +251,10 @@ export default function SharePage() {
 
         {dashboard.html_content && (
           <Card>
-            <CardContent className="p-0">
+            <CardContent className="p-0 relative">
               <iframe
                 ref={iframeRef}
+                key={dashboard.id}
                 srcDoc={dashboard.html_content}
                 title={dashboard.name || "看板"}
                 sandbox="allow-scripts allow-same-origin"
@@ -264,8 +265,16 @@ export default function SharePage() {
                   if (iframe?.contentDocument?.body) {
                     iframe.style.height = `${iframe.contentDocument.body.scrollHeight + 40}px`;
                   }
+                  setIframeLoading(false);
                 }}
               />
+              {iframeLoading && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/85 backdrop-blur-sm">
+                  <Loader2 className="h-8 w-8 animate-spin text-blue-600 mb-3" />
+                  <p className="text-sm text-slate-600">看板内容加载中…</p>
+                  <p className="text-xs text-slate-400 mt-1">数据量较大时可能需要数秒，请稍候</p>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}

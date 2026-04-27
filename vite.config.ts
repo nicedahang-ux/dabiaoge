@@ -1,9 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
+import { readFileSync } from "fs";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+
+const tauriConf = JSON.parse(
+  readFileSync(path.resolve(__dirname, "./src-tauri/tauri.conf.json"), "utf-8")
+);
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -12,6 +17,10 @@ export default defineConfig(async () => ({
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
+  },
+
+  define: {
+    __APP_VERSION__: JSON.stringify(tauriConf.version),
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

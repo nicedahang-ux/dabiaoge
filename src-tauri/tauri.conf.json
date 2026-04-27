@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AI表格转看板",
-  "version": "0.2.1",
+  "version": "1.0.0",
   "identifier": "com.aiexcel.kanban",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -32,7 +32,10 @@
             "opener:allow-open-url",
             "opener:allow-open-path",
             "dialog:allow-open",
-            "dialog:default"
+            "dialog:default",
+            "autostart:allow-enable",
+            "autostart:allow-disable",
+            "autostart:allow-is-enabled"
           ]
         }
       ]

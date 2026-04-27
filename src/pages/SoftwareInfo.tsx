@@ -25,7 +25,6 @@ import {
 import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
-const CURRENT_VERSION = "0.2.0";
 const UPDATE_ENDPOINT = "https://excel.lidani.cn:8990";
 
 const FEATURES = [
@@ -52,6 +51,15 @@ const FEATURES = [
 ];
 
 const CHANGELOG = [
+  {
+    version: "1.0.0",
+    date: "2026-04-26",
+    items: [
+      "优化HTML生成",
+      "支持复制模板",
+      "优化分享功能",
+    ],
+  },  
   {
     version: "0.2.0",
     date: "2026-04-26",
@@ -180,7 +188,7 @@ export default function SoftwareInfo() {
       if (res.ok) {
         const data: HistoryVersion[] = await res.json();
         // 过滤掉当前版本及更高版本（只保留可降级的旧版本）
-        const older = data.filter((v) => compareVersion(v.version, CURRENT_VERSION) < 0);
+        const older = data.filter((v) => compareVersion(v.version, __APP_VERSION__) < 0);
         setHistoryVersions(older);
       }
     } catch {
@@ -270,7 +278,7 @@ export default function SoftwareInfo() {
             <div className="space-y-1">
               <p className="text-sm font-medium text-slate-700">当前版本</p>
               <div className="flex items-center gap-2">
-                <Badge variant="secondary">v{CURRENT_VERSION}</Badge>
+                <Badge variant="secondary">v{__APP_VERSION__}</Badge>
                 {updateInfo ? (
                   <Badge variant="destructive" className="flex items-center gap-1">
                     <AlertCircle className="h-3 w-3" />

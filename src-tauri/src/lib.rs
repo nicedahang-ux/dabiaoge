@@ -814,6 +814,8 @@ async fn chat_workbench(
         system_content.push_str("\n\n【数据库表查询能力】当前已提供数据库表结构和预览数据。请基于这些预览理解数据并设计可视化方案；最终请直接输出完整 HTML 看板代码块，不要再返回任何 JSON action。");
     }
 
+    let is_modifying = modifying_dashboard.unwrap_or(false);
+
     let mut chat_messages: Vec<ChatMessage> = vec![ChatMessage {
         role: "system".to_string(),
         content: serde_json::Value::String(system_content),
@@ -855,19 +857,31 @@ async fn chat_workbench(
                 "column_remarks": column_remarks,
                 "preview_data": p.preview_data,
             })).unwrap_or_default();
+            let header = if is_modifying {
+                format!(
+                    "【看板关联数据表 {}】这是你当前正在修改的看板所关联的源数据表，必须沿用其列名和数据 key 风格（columns 是英文列名；column_remarks 是 英文列名→中文备注 映射；运行时 window.__dashboardData 的每一行**同时**带英文 key 和中文 key，原 HTML 用哪种就继续用哪种，禁止换风格）:\n",
+                    p.table_name
+                )
+            } else {
+                format!(
+                    "数据库表 [{}] 预览数据（columns 是英文列名；column_remarks 是 英文列名→中文备注 映射；运行时 window.__dashboardData 的每一行**同时**带英文 key 和中文 key，请任选一种作为数据 key 使用，但同一份 HTML 内必须保持一致）:\n",
+                    p.table_name
+                )
+            };
             chat_messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: serde_json::Value::String(format!(
-                    "数据库表 [{}] 预览数据（columns 是英文列名；column_remarks 是 英文列名→中文备注 映射；运行时 window.__dashboardData 的每一行**同时**带英文 key 和中文 key，请任选一种作为数据 key 使用，但同一份 HTML 内必须保持一致）:\n{}",
-                    p.table_name, preview_json
-                )),
+                content: serde_json::Value::String(format!("{}{}", header, preview_json)),
             });
         }
-        println!("[chat_workbench] 已注入 {} 张数据库表预览", db_previews.len());
+        println!("[chat_workbench] 已注入 {} 张数据库表预览（modify={}）", db_previews.len(), is_modifying);
     }
 
     if let Some(attach_previews) = chat_attachment_previews {
-        let mut attach_text = format!("用户在聊天中上传了 {} 张表格附件。当用户提到某个文件名或 Sheet 名时，请从下方对应附件中查找数据。\n", attach_previews.len());
+        let mut attach_text = if is_modifying {
+            format!("【本轮新增候选数据】用户在本次修改对话中又上传了 {} 张表格附件，请判断是否需要把它们融入当前看板（仅当用户明确要求或数据明显匹配时才使用）。\n", attach_previews.len())
+        } else {
+            format!("用户在聊天中上传了 {} 张表格附件。当用户提到某个文件名或 Sheet 名时，请从下方对应附件中查找数据。\n", attach_previews.len())
+        };
         for (i, p) in attach_previews.iter().enumerate() {
             let preview_json = serde_json::to_string(&serde_json::json!({
                 "文件": p.file_name,
@@ -881,7 +895,7 @@ async fn chat_workbench(
             role: "system".to_string(),
             content: serde_json::Value::String(attach_text),
         });
-        println!("[chat_workbench] 已注入 {} 张聊天附件表格预览", attach_previews.len());
+        println!("[chat_workbench] 已注入 {} 张聊天附件表格预览（modify={}）", attach_previews.len(), is_modifying);
     }
 
     for (i, msg) in messages.iter().enumerate() {
@@ -3293,6 +3307,196 @@ async fn ingest_full_data(
     Ok(())
 }
 
+/// 快速将单个文件原样入库（不做 AI 清洗），供聊天附件预入库使用。
+/// 返回 DbTablePreviewPayload，方便前端直接加入 dbTablePreviews。
+#[tauri::command]
+async fn quick_ingest_file(
+    app: tauri::AppHandle,
+    file_path: String,
+) -> Result<DbTablePreviewPayload, String> {
+    let path = std::path::Path::new(&file_path);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // 1. 生成唯一表名（复用前端 toTargetName + ensureUniqueName 逻辑）
+    let base_name = {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("data");
+        let sanitized: String = stem
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        if sanitized.is_empty() || sanitized.chars().all(|c| c == '_') {
+            "t_data".to_string()
+        } else {
+            sanitized
+        }
+    };
+
+    let conn = init_db()?;
+    let existing_tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let table_name = {
+        if !existing_tables.contains(&base_name) {
+            base_name.clone()
+        } else {
+            let mut idx = 2;
+            loop {
+                let candidate = format!("{}_{}", base_name, idx);
+                if !existing_tables.contains(&candidate) {
+                    break candidate;
+                }
+                idx += 1;
+            }
+        }
+    };
+
+    // 2. 读取表头
+    let columns: Vec<String>;
+    if ext == "csv" {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut rdr = csv::Reader::from_reader(file);
+        columns = rdr
+            .headers()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|s| sanitize_col(s))
+            .collect();
+    } else if ext == "xlsx" || ext == "xls" {
+        let range = if ext == "xlsx" {
+            let cursor = remove_cdata_from_xlsx(path)?;
+            let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
+                .map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        };
+        columns = range
+            .rows()
+            .next()
+            .map(|r| r.iter().map(|c| sanitize_col(&c.to_string())).collect())
+            .unwrap_or_default();
+    } else {
+        return Err("仅支持 xlsx/xls/csv".to_string());
+    }
+
+    if columns.is_empty() {
+        return Err("无法读取表头".to_string());
+    }
+
+    // 3. 建表（全部 TEXT）
+    let cols_def = columns
+        .iter()
+        .map(|c| format!("{} TEXT", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = conn.execute(&format!("DROP TABLE IF EXISTS {}", table_name), []);
+    conn.execute(
+        &format!("CREATE TABLE {} ({})", table_name, cols_def),
+        [],
+    )
+    .map_err(|e| format!("创建表失败: {}", e))?;
+
+    // 4. 写入数据
+    let chunk_size = 5000;
+    if ext == "csv" {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut rdr = csv::Reader::from_reader(file);
+        let mut chunk: Vec<Vec<String>> = vec![];
+        for result in rdr.records() {
+            if let Ok(rec) = result {
+                chunk.push(rec.iter().map(|s| s.to_string()).collect());
+                if chunk.len() >= chunk_size {
+                    insert_chunk(&conn, &table_name, &columns, &chunk)?;
+                    chunk.clear();
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            insert_chunk(&conn, &table_name, &columns, &chunk)?;
+        }
+    } else {
+        let range = if ext == "xlsx" {
+            let cursor = remove_cdata_from_xlsx(path)?;
+            let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
+                .map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        } else {
+            let mut workbook = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
+            let first_sheet = workbook.sheet_names().get(0).cloned().unwrap_or_default();
+            workbook
+                .worksheet_range(&first_sheet)
+                .map_err(|e| e.to_string())?
+        };
+        let mut rows = range.rows();
+        rows.next(); // skip header
+        let mut chunk: Vec<Vec<String>> = vec![];
+        for row in rows {
+            let row_vals: Vec<String> = row.iter().map(|c| c.to_string()).collect();
+            if row_vals.iter().all(|v| v.trim().is_empty()) {
+                continue;
+            }
+            chunk.push(row_vals);
+            if chunk.len() >= chunk_size {
+                insert_chunk(&conn, &table_name, &columns, &chunk)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            insert_chunk(&conn, &table_name, &columns, &chunk)?;
+        }
+    }
+
+    // 5. 取前 5 行作为预览返回
+    let preview_data: Vec<Vec<String>> = {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {} LIMIT 5", table_name))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let mut vals = vec![];
+                for i in 0..columns.len() {
+                    vals.push(row.get::<_, String>(i).unwrap_or_default());
+                }
+                Ok(vals)
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    Ok(DbTablePreviewPayload {
+        table_name,
+        remark: String::new(),
+        columns,
+        preview_data,
+        column_remarks: std::collections::HashMap::new(),
+    })
+}
+
 fn insert_chunk(
     conn: &rusqlite::Connection,
     table: &str,
@@ -4580,6 +4784,24 @@ async fn create_dashboard_from_ai_html_inner(
         .or_else(|| existing_tables.first().cloned())
         .ok_or("缺少 source_table：既没有新建表，也没有选择已有表")?;
 
+    // 防御：source_table 必须真实存在于 SQLite，否则视为创建失败（避免看板挂着不存在的表）
+    {
+        let conn = init_db()?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![&source_table],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Err(format!(
+                "看板关联的数据表 '{}' 在数据库中不存在，看板创建未完成",
+                source_table
+            ));
+        }
+    }
+
     let final_name = dashboard_name
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "AI 生成看板".to_string());
@@ -4945,6 +5167,7 @@ pub fn run() {
             chat_with_ai,
             chat_workbench,
             ingest_full_data,
+            quick_ingest_file,
             search_kb,
             get_db_tables,
             list_db_tables_for_chat,
