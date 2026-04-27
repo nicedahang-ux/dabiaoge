@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local environment / test scripts
+*.exe
+*.cmd
+*.ps1
+
+# Release artifacts
+update-server/public/*.zip
+
+# Temp / empty files
+src-tauri/aiexcel2024
