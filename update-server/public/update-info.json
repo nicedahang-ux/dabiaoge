@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
-  "notes": "优化生成HTML问题和看板复制功能",
-  "pub_date": "2026-04-26T12:00:00Z",
-  "url": "https://excel.lidani.cn:8990/download/AI表格转看板_1.0.0_x64-setup.nsis.zip",
-  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUlZZQ1dLVXJZRXhoUFdKZ25pOVMwdWM2bDVLOTkwekNtcDQrbG1Vc3p1MmpLdTFERUloTkpUR1cybWxwcU5YQ1p3L1VBQ1NkTE5WVWhHRkdMSzVQd2FlZDlXYVdpcWc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3MjQ2ODY0CWZpbGU6QUnooajmoLzovaznnIvmnb9fMS4wLjBfeDY0LXNldHVwLm5zaXMuemlwCklCbkJ1TmRucXgxWlhmVmYrN280VmhoZkU3T1E1dkI5cG8waytUaC9rZlIvWkk5ZEYxcmpKcGt6SHpRR0xnZEdSbDBneWt1UjNFUitqcXFuYzZ2YkRBPT0K"
+  "version": "1.0.2",
+  "notes": "新增字体可调整，侧边栏可拖拽宽度",
+  "pub_date": "2026-04-27T12:00:00Z",
+  "url": "https://excel.lidani.cn:8990/download/AI表格转看板_1.0.2_x64-setup.nsis.zip",
+  "signature": ""
 }

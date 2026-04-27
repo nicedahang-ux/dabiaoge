@@ -457,10 +457,8 @@ export default function CreateDashboardModal({
                     ) : (
                       <Popover open={tableSelectOpen} onOpenChange={setTableSelectOpen}>
                         <PopoverTrigger>
-                          <Button
-                            variant="outline"
-                            className="w-full justify-between"
-                            type="button"
+                          <div
+                            className="w-full justify-between flex items-center px-3 py-2 rounded-md border border-slate-200 bg-white text-sm cursor-pointer hover:bg-slate-50"
                           >
                             <span className="truncate">
                               {selectedTables.size === 0
@@ -468,7 +466,7 @@ export default function CreateDashboardModal({
                                 : `已选 ${selectedTables.size} 张表`}
                             </span>
                             <ChevronDown className="h-4 w-4 text-slate-400" />
-                          </Button>
+                          </div>
                         </PopoverTrigger>
                         <PopoverContent className="w-[360px] p-0 bg-white" align="start">
                           <div className="p-2 border-b">

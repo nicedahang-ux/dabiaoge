@@ -1,16 +1,28 @@
 [
   {
+    "version": "1.0.2",
+    "date": "2026-04-27",
+    "notes": "新增字体可调整，侧边栏可拖拽宽度",
+    "filename": "AI表格转看板_1.0.2_x64-setup.nsis.zip"
+  },
+  {
+    "version": "1.0.1",
+    "date": "2026-04-27",
+    "notes": "优化钉钉回复功能",
+    "filename": "AI表格转看板_1.0.1_x64-setup.nsis.zip"
+  },
+  {
     "version": "1.0.0",
     "date": "2026-04-26",
     "notes": "优化生成HTML问题和看板复制功能",
     "filename": "AI表格转看板_1.0.0_x64-setup.nsis.zip"
-  },  
+  },
   {
     "version": "0.2.1",
     "date": "2026-04-26",
     "notes": "优化html生成功能",
     "filename": "AI表格转看板_0.2.1_x64-setup.nsis.zip"
-  },  
+  },
   {
     "version": "0.2.0",
     "date": "2026-04-26",

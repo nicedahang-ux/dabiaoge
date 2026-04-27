@@ -614,6 +614,85 @@ fn reverse_fuzzy_search(
     results
 }
 
+/// 为 Bot 执行看板 SQL：将 {{变量}} 用用户关键词智能替换后执行，返回 Markdown 表格
+fn run_dashboard_sql_for_bot(sql_template: &str, keywords: &[String]) -> Option<String> {
+    if sql_template.trim().is_empty() {
+        return None;
+    }
+    let mut sql = sql_template.to_string();
+    let re = regex::Regex::new(r"\{\{(.*?)\}\}").ok()?;
+
+    // 第一次遍历：智能替换 {{变量}} 为关键词
+    for cap in re.captures_iter(sql_template) {
+        let placeholder = cap.get(0)?.as_str();
+        let var_name = cap.get(1)?.as_str().to_lowercase();
+        let replacement = if var_name.contains("款号") || var_name.contains("编码") || var_name.contains("型号") || var_name.contains("sku") || var_name.contains("货号") {
+            // 找包含字母+数字的关键词（如 LDN26126）
+            keywords.iter().find(|k| k.chars().any(|c| c.is_alphabetic()) && k.chars().any(|c| c.is_numeric())).cloned()
+        } else if var_name.contains("店铺") || var_name.contains("店名") || var_name.contains("门店") {
+            keywords.iter().find(|k| k.contains("店") || k.contains("旗舰") || k.contains("专卖")).cloned()
+        } else {
+            keywords.first().cloned()
+        }.unwrap_or_default();
+        sql = sql.replace(placeholder, &replacement);
+    }
+
+    // 第二次遍历：把剩余的 {{...}} 替换为空字符串（兜底）
+    let re2 = regex::Regex::new(r"\{\{.*?\}\}").ok()?;
+    sql = re2.replace_all(&sql, "''").to_string();
+
+    let sql_trimmed = sql.trim();
+    if sql_trimmed.is_empty() {
+        return None;
+    }
+    // 安全检查：只允许 SELECT
+    let lower = sql_trimmed.to_lowercase();
+    if !lower.starts_with("select") {
+        return None;
+    }
+    println!("[Bot SQL] 执行看板 SQL: {}", sql_trimmed);
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[Bot SQL] 数据库连接失败: {}", e);
+            return None;
+        }
+    };
+    let mut stmt = match conn.prepare(sql_trimmed) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("[Bot SQL] SQL 准备失败: {} | SQL: {}", e, sql_trimmed);
+            return None;
+        }
+    };
+    let cols: Vec<String> = stmt.column_names().into_iter().map(|s| s.to_string()).collect();
+    let rows = match stmt.query_map([], |row| {
+        let vals: Vec<String> = (0..cols.len())
+            .map(|i| row.get::<usize, String>(i).unwrap_or_default())
+            .collect();
+        Ok(vals)
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[Bot SQL] 查询执行失败: {} | SQL: {}", e, sql_trimmed);
+            return None;
+        }
+    };
+    let mut lines = vec![cols.join(" | ")];
+    for r in rows {
+        if let Ok(vals) = r {
+            lines.push(vals.join(" | "));
+        }
+    }
+    println!("[Bot SQL] 查询结果 {} 行", lines.len().saturating_sub(1));
+    if lines.len() > 1 {
+        Some(lines.join("\n"))
+    } else {
+        println!("[Bot SQL] 查询结果为空");
+        None
+    }
+}
+
 const MEMORY_EXPIRE_HOURS: i64 = 24;
 const ROUND_REMINDER_THRESHOLD: i32 = 3;
 
@@ -720,10 +799,11 @@ async fn handle_message(
         description: String,
         source_table: String,
         table_data: String,
+        sql_template: String,
     }
     let dashboards: Vec<DashInfo> = {
         let mut stmt = conn
-            .prepare("SELECT id, name, description, source_table, table_data FROM dashboards ORDER BY updated_at DESC LIMIT 10")
+            .prepare("SELECT id, name, description, source_table, table_data, sql_template FROM dashboards ORDER BY updated_at DESC LIMIT 10")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -733,19 +813,41 @@ async fn handle_message(
                     description: row.get(2).unwrap_or_default(),
                     source_table: row.get(3).unwrap_or_default(),
                     table_data: row.get(4).unwrap_or_default(),
+                    sql_template: row.get(5).unwrap_or_default(),
                 })
             })
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // 看板明细预览：优先用看板自身已计算好的 table_data（前 20 行），AI 直接看到现成结果，
-    // 不需要再去原始表里硬算交叉表
+    // 反向模糊查询：让 AI 抽取候选关键词，去原始表里 LIKE 探查，命中的表反查关联看板
+    let kw_client = reqwest::Client::new();
+    let keywords = extract_search_keywords(&kw_client, config, content).await;
+
+    // 看板明细预览：优先执行 sql_template 获取实时数据，其次用 table_data（前 20 行）
     let mut dashboard_previews: Vec<String> = vec![];
     for d in &dashboards {
-        let mut preview = format_dashboard_table_preview(&d.table_data, 20);
+        let mut preview = String::new();
+        // 1. 优先尝试执行 sql_template 获取实时数据
+        if !d.sql_template.trim().is_empty() {
+            if let Some(sql_result) = run_dashboard_sql_for_bot(&d.sql_template, &keywords) {
+                // 只取前 20 行
+                let lines: Vec<&str> = sql_result.lines().collect();
+                if lines.len() > 21 {
+                    let mut truncated = lines[..21].join("\n");
+                    truncated.push_str(&format!("\n... 还有 {} 行未展示", lines.len() - 21));
+                    preview = truncated;
+                } else {
+                    preview = sql_result;
+                }
+            }
+        }
+        // 2. SQL 执行失败或为空，退回到 table_data
+        if preview.is_empty() {
+            preview = format_dashboard_table_preview(&d.table_data, 20);
+        }
+        // 3. 还没有，取源表第 1 行
         if preview.is_empty() && !d.source_table.is_empty() {
-            // 没有 table_data，退回原来的逻辑：取源表第 1 行
             let preview_sql = format!(r#"SELECT * FROM "{}" LIMIT 1"#, d.source_table);
             let raw = run_local_sql(&preview_sql).await;
             if !raw.is_empty() && !raw.starts_with("SQL") && !raw.starts_with("查询失败") {
@@ -760,23 +862,50 @@ async fn handle_message(
         }
     }
 
-    // 反向模糊查询：让 AI 抽取候选关键词，去原始表里 LIKE 探查，命中的表反查关联看板
-    let kw_client = reqwest::Client::new();
-    let keywords = extract_search_keywords(&kw_client, config, content).await;
-
     // 在看板 table_data 中直接搜索匹配关键词的行（现成计算数据优先）
     let mut direct_hit_section = String::new();
     if !keywords.is_empty() {
         let mut direct_hits: Vec<(String, Vec<serde_json::Map<String, serde_json::Value>>)> = vec![];
         for d in &dashboards {
-            if d.table_data.trim().is_empty() {
+            println!("[Bot Debug] 检查看板: id={}, name={}, source_table={}, sql_template_len={}, table_data_len={}",
+                d.id, d.name, d.source_table, d.sql_template.len(), d.table_data.len());
+            // 如果 table_data 为空但 source_table 不为空，尝试自动刷新
+            let mut table_data = d.table_data.clone();
+            if table_data.trim().is_empty() && !d.source_table.is_empty() {
+                println!("[Bot Debug] 看板《{}》table_data 为空，尝试从 source_table 刷新...", d.name);
+                match crate::refresh_dashboard_table_data(d.id.clone()) {
+                    Ok(count) => {
+                        println!("[Bot Debug] 看板《{}》刷新成功，共 {} 行", d.name, count);
+                        // 重新读取 table_data
+                        let conn = init_db().ok();
+                        if let Some(c) = conn {
+                            if let Ok(td) = c.query_row(
+                                "SELECT table_data FROM dashboards WHERE id = ?1",
+                                [&d.id],
+                                |row| row.get::<_, String>(0),
+                            ) {
+                                table_data = td;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[Bot Debug] 看板《{}》刷新失败: {}", d.name, e);
+                    }
+                }
+            }
+            if table_data.trim().is_empty() {
+                println!("[Bot Debug] 看板《{}》table_data 仍为空，跳过", d.name);
                 continue;
             }
             let rows: Vec<serde_json::Map<String, serde_json::Value>> =
-                match serde_json::from_str(&d.table_data) {
+                match serde_json::from_str(&table_data) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        println!("[Bot Debug] 看板《{}》table_data JSON 解析失败: {}", d.name, e);
+                        continue;
+                    }
                 };
+            println!("[Bot Debug] 看板《{}》table_data 共 {} 行", d.name, rows.len());
             let mut matched_rows = vec![];
             for row in &rows {
                 let row_text = row.values().map(|v| match v {
@@ -792,29 +921,72 @@ async fn handle_message(
                     }
                 }
             }
+            println!("[Bot Debug] 看板《{}》匹配到 {} 行", d.name, matched_rows.len());
             if !matched_rows.is_empty() {
                 direct_hits.push((d.name.clone(), matched_rows));
             }
         }
+        // 看板去重：按名称与用户问题的相关性排序，只保留最相关的 1 个看板，避免多看板数据冲突
+        if direct_hits.len() > 1 {
+            let content_lower = content.to_lowercase();
+            let core_terms = ["店铺", "发货", "数量", "占比", "款号", "编码", "商品", "销售", "库存"];
+            let mut scored: Vec<(String, Vec<serde_json::Map<String, serde_json::Value>>, i32)> = direct_hits
+                .into_iter()
+                .map(|(name, rows)| {
+                    let name_lower = name.to_lowercase();
+                    let mut score = 0i32;
+                    for term in &core_terms {
+                        if name_lower.contains(term) && content_lower.contains(term) {
+                            score += 3;
+                        } else if name_lower.contains(term) {
+                            score += 1;
+                        }
+                    }
+                    // 匹配行越多越优先
+                    score += rows.len() as i32;
+                    (name, rows, score)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.2.cmp(&a.2));
+            println!("[Bot Debug] 多个看板命中，按相关性排序: {:?}", scored.iter().map(|(n, _, s)| format!("{}(score={})", n, s)).collect::<Vec<_>>());
+            direct_hits = scored.into_iter().take(1).map(|(n, r, _)| (n, r)).collect();
+        }
         if !direct_hits.is_empty() {
             let mut buf = String::from("🎯【看板直接命中】用户提到的关键词在看板明细数据中已有完整记录，请直接根据以下数据回答，禁止再去原始表里查询！\n\n");
             for (board_name, rows) in &direct_hits {
-                buf.push_str(&format!("看板《{}》匹配数据：\n", board_name));
-                if let Some(first_row) = rows.first() {
-                    let cols: Vec<String> = first_row.keys().cloned().collect();
-                    let mut lines = vec![cols.join(" | ")];
-                    for row in rows.iter().take(20) {
-                        let vals: Vec<String> = cols.iter().map(|c| match row.get(c) {
-                            Some(serde_json::Value::String(s)) => s.clone(),
-                            Some(serde_json::Value::Number(n)) => n.to_string(),
-                            Some(serde_json::Value::Bool(b)) => b.to_string(),
-                            Some(serde_json::Value::Null) | None => String::new(),
-                            Some(other) => other.to_string(),
-                        }).collect();
-                        lines.push(vals.join(" | "));
-                    }
-                    buf.push_str(&lines.join("\n"));
+                buf.push_str(&format!("看板《{}》匹配数据（共 {} 行）：\n", board_name, rows.len()));
+                // 优先尝试执行看板的 sql_template 获取实时数据
+                let target_board = dashboards.iter().find(|d| d.name == *board_name);
+                let sql_result: Option<String> = target_board.and_then(|d| {
+                    println!("[Bot Debug] 尝试执行看板《{}》sql_template: {}", d.name, d.sql_template);
+                    run_dashboard_sql_for_bot(&d.sql_template, &keywords)
+                });
+                if let Some(ref sql_table) = sql_result {
+                    println!("[Bot Debug] 看板《{}》SQL 执行成功，返回 {} 行", board_name, sql_table.lines().count().saturating_sub(1));
+                    buf.push_str(sql_table);
                     buf.push_str("\n\n");
+                } else {
+                    println!("[Bot Debug] 看板《{}》SQL 执行失败或为空，退回 table_data", board_name);
+                    if let Some(first_row) = rows.first() {
+                        let cols: Vec<String> = first_row.keys().cloned().collect();
+                        let mut lines = vec![cols.join(" | ")];
+                        // 发送所有匹配行，不再限制 20 行，避免数据不完整
+                        for row in rows.iter().take(200) {
+                            let vals: Vec<String> = cols.iter().map(|c| match row.get(c) {
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(serde_json::Value::Number(n)) => n.to_string(),
+                                Some(serde_json::Value::Bool(b)) => b.to_string(),
+                                Some(serde_json::Value::Null) | None => String::new(),
+                                Some(other) => other.to_string(),
+                            }).collect();
+                            lines.push(vals.join(" | "));
+                        }
+                        if rows.len() > 200 {
+                            lines.push(format!("... 还有 {} 行未展示", rows.len() - 200));
+                        }
+                        buf.push_str(&lines.join("\n"));
+                        buf.push_str("\n\n");
+                    }
                 }
             }
             direct_hit_section = buf;

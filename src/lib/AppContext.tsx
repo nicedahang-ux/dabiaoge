@@ -71,6 +71,8 @@ interface AppState {
   boardsSelectedId: string | null;
   workbenchDashboardTag: string | undefined;
   botStatus: "connected" | "disconnected";
+  fontScale: number;
+  setFontScale: (scale: number) => void;
   switchView: (view: ViewType) => void;
   setSessions: (sessions: Session[]) => void;
   setCurrentSessionId: (id: string | null) => void;
@@ -96,6 +98,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [boardsSelectedId, setBoardsSelectedId] = useState<string | null>(null);
   const [workbenchDashboardTag, setWorkbenchDashboardTag] = useState<string | undefined>(undefined);
   const [botStatus, setBotStatus] = useState<"connected" | "disconnected">("disconnected");
+  const [fontScale, setFontScaleState] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem("font_scale");
+      if (raw) {
+        const val = parseFloat(raw);
+        if (!isNaN(val) && val >= 0.5 && val <= 5) return Math.round(val * 10) / 10;
+      }
+    } catch {}
+    return 1;
+  });
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -148,13 +160,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
       });
     };
     setup();
+    // 兜底轮询：每 3 秒刷新一次状态，避免事件丢失导致显示不同步
+    const interval = setInterval(() => {
+      refreshBotStatus();
+    }, 3000);
     return () => {
       if (unlisten) unlisten();
+      clearInterval(interval);
     };
   }, [refreshBotStatus]);
 
   const switchView = useCallback((view: ViewType) => {
     setActiveView(view);
+  }, []);
+
+  const setFontScale = useCallback((scale: number) => {
+    const clamped = Math.max(0.5, Math.min(5, Math.round(scale * 10) / 10));
+    setFontScaleState(clamped);
+    try {
+      localStorage.setItem("font_scale", String(clamped));
+    } catch {}
   }, []);
 
   return (
@@ -169,6 +194,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         boardsSelectedId,
         workbenchDashboardTag,
         botStatus,
+        fontScale,
+        setFontScale,
         switchView,
         setSessions,
         setCurrentSessionId,

@@ -21,7 +21,12 @@ import {
   AlertCircle,
   History,
   ExternalLink,
+  Type,
+  Minus,
+  Plus,
 } from "lucide-react";
+import { useApp } from "@/lib/AppContext";
+import { Input } from "@/components/ui/input";
 import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -52,6 +57,21 @@ const FEATURES = [
 
 const CHANGELOG = [
   {
+    version: "1.0.2",
+    date: "2026-04-27",
+    items: [
+      "新增字体可调整",
+      "侧边栏可拖拽宽度",
+    ],
+  },
+  {
+    version: "1.0.1",
+    date: "2026-04-27",
+    items: [
+      "优化钉钉回复功能",
+    ],
+  },
+  {
     version: "1.0.0",
     date: "2026-04-26",
     items: [
@@ -81,6 +101,7 @@ interface HistoryVersion {
 }
 
 export default function SoftwareInfo() {
+  const { fontScale, setFontScale } = useApp();
   const [checking, setChecking] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<{
     version: string;
@@ -267,6 +288,80 @@ export default function SoftwareInfo() {
           );
         })}
       </div>
+
+      {/* 字体大小设置 */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg flex items-center gap-2">
+            <Type className="h-5 w-5 text-slate-600" />
+            显示设置
+          </CardTitle>
+          <CardDescription>调整整体字体显示比例</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center gap-4">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 w-8 p-0"
+              onClick={() => setFontScale(Math.max(0.5, Math.round((fontScale - 0.1) * 10) / 10))}
+              disabled={fontScale <= 0.5}
+            >
+              <Minus className="h-4 w-4" />
+            </Button>
+            <div className="flex-1">
+              <input
+                type="range"
+                min="0.5"
+                max="5"
+                step="0.1"
+                value={fontScale}
+                onChange={(e) => setFontScale(parseFloat(e.target.value))}
+                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+              />
+              <div className="flex justify-between text-xs text-slate-400 mt-1">
+                <span>0.5x</span>
+                <span>1.0x</span>
+                <span>2.5x</span>
+                <span>5.0x</span>
+              </div>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 w-8 p-0"
+              onClick={() => setFontScale(Math.min(5, Math.round((fontScale + 0.1) * 10) / 10))}
+              disabled={fontScale >= 5}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-slate-600">当前缩放:</span>
+            <Input
+              type="number"
+              min={0.5}
+              max={5}
+              step={0.1}
+              value={fontScale}
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                if (!isNaN(val)) setFontScale(val);
+              }}
+              className="w-24 h-8 text-sm"
+            />
+            <span className="text-sm text-slate-500">倍</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs text-slate-400 hover:text-slate-600"
+              onClick={() => setFontScale(1)}
+            >
+              恢复默认
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

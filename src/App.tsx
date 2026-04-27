@@ -145,23 +145,56 @@ function ShareButton() {
 }
 
 function MainLayout() {
-  const { activeView, switchView, botStatus } = useApp();
+  const { activeView, switchView, botStatus, fontScale } = useApp();
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const raw = localStorage.getItem("main_sidebar_width");
+      return raw ? Math.max(180, Math.min(500, parseInt(raw, 10))) : 240;
+    } catch {
+      return 240;
+    }
+  });
 
-  // 注：不再自动启动钉钉监听，用户需手动在「系统配置」中点击「启动」
-  // useEffect(() => {
-  //   async function autoStartBot() {
-  //     try {
-  //       const { invoke } = await import("@tauri-apps/api/core");
-  //       const config = await invoke<{ ding_app_key?: string; ding_app_secret?: string }>("load_config");
-  //       if (config.ding_app_key && config.ding_app_secret) {
-  //         await invoke("start_bot");
-  //       }
-  //     } catch {
-  //       // 静默失败，不打扰用户
-  //     }
-  //   }
-  //   autoStartBot();
-  // }, []);
+  const handleResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    let currentWidth = startWidth;
+
+    const onMove = (e: MouseEvent) => {
+      currentWidth = Math.max(180, Math.min(500, startWidth + e.clientX - startX));
+      setSidebarWidth(currentWidth);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      try {
+        localStorage.setItem("main_sidebar_width", String(currentWidth));
+      } catch {}
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  useEffect(() => {
+    document.documentElement.style.fontSize = `${fontScale * 100}%`;
+  }, [fontScale]);
+
+  useEffect(() => {
+    async function autoStartBot() {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const config = await invoke<{ ding_app_key?: string; ding_app_secret?: string }>("load_config");
+        if (config.ding_app_key && config.ding_app_secret) {
+          await invoke("start_bot");
+        }
+      } catch {
+        // 静默失败，不打扰用户
+      }
+    }
+    autoStartBot();
+  }, []);
 
   // 轮询检测外部Python入库后的刷新信号
   useEffect(() => {
@@ -194,7 +227,7 @@ function MainLayout() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-white">
-      <aside className="w-[240px] flex-shrink-0 bg-slate-50 border-r border-slate-200 flex flex-col">
+      <aside className="flex-shrink-0 bg-slate-50 border-r border-slate-200 flex flex-col relative" style={{ width: sidebarWidth }}>
         <div className="p-4 border-b border-slate-200">
           <div className="flex items-center gap-2 font-semibold text-slate-800">
             <Bot className="h-5 w-5 text-blue-600" />
@@ -233,6 +266,12 @@ function MainLayout() {
             {botStatus === "connected" ? "钉钉服务监听中..." : "钉钉服务未连接"}
           </div>
         </div>
+        {/* 拖拽调整宽度 */}
+        <div
+          className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-blue-400 active:bg-blue-600 transition-colors z-10"
+          onMouseDown={handleResizeStart}
+          title="拖拽调整宽度"
+        />
       </aside>
 
       <main className="flex-1 overflow-hidden flex flex-col">

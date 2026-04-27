@@ -125,6 +125,38 @@ export default function DatabaseView() {
   const [page, setPage] = useState(1);
   const [jumpPageInput, setJumpPageInput] = useState("");
 
+  // 左侧列表宽度 + 拖拽
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const raw = localStorage.getItem("db_sidebar_width");
+      return raw ? Math.max(180, Math.min(500, parseInt(raw, 10))) : 240;
+    } catch {
+      return 240;
+    }
+  });
+
+  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    let currentWidth = startWidth;
+
+    const onMove = (e: MouseEvent) => {
+      currentWidth = Math.max(180, Math.min(500, startWidth + e.clientX - startX));
+      setSidebarWidth(currentWidth);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      try {
+        localStorage.setItem("db_sidebar_width", String(currentWidth));
+      } catch {}
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [sidebarWidth]);
+
   const loadTables = async () => {
     setRefreshing(true);
     try {
@@ -360,7 +392,7 @@ export default function DatabaseView() {
   return (
     <div className="flex h-full">
       {/* 左侧表列表 */}
-      <div className="w-[240px] border-r bg-slate-50 flex flex-col">
+      <div className="border-r bg-slate-50 flex flex-col relative" style={{ width: sidebarWidth }}>
         <div className="p-3 border-b flex items-center justify-between">
           <div className="flex items-center gap-2 text-sm font-medium">
             <Database className="h-4 w-4 text-blue-600" />
@@ -414,18 +446,18 @@ export default function DatabaseView() {
                     <Table2 className="h-4 w-4 flex-shrink-0" />
                     <span className="flex-1 text-left truncate">{table}</span>
                     {isSystem ? (
-                      <span className="inline-flex items-center gap-1 text-[10px] text-red-600 font-medium">
+                      <span className="inline-flex items-center gap-1 text-[0.625rem] text-red-600 font-medium">
                         <Shield className="h-3 w-3" />
                         {sysInfo.label}
                       </span>
                     ) : isLocked ? (
-                      <span className="inline-flex items-center gap-1 text-[10px] text-amber-600 font-medium">
+                      <span className="inline-flex items-center gap-1 text-[0.625rem] text-amber-600 font-medium">
                         <Shield className="h-3 w-3" />
                         锁定
                       </span>
                     ) : (
                       tableRemarks[table] && (
-                        <span className="text-[10px] text-slate-400 italic truncate max-w-[120px]">
+                        <span className="text-[0.625rem] text-slate-400 italic truncate max-w-[120px]">
                           {tableRemarks[table]}
                         </span>
                       )
@@ -462,7 +494,7 @@ export default function DatabaseView() {
                   {isSystem && (
                     <div className="flex items-center gap-1 pl-6">
                       <Shield className="h-3 w-3 text-red-500" />
-                      <span className="text-[10px] text-red-500 truncate">
+                      <span className="text-[0.625rem] text-red-500 truncate">
                         {sysInfo.description}（系统表，不可删除）
                       </span>
                     </div>
@@ -470,7 +502,7 @@ export default function DatabaseView() {
                   {isLocked && (
                     <div className="flex items-center gap-1 pl-6">
                       <Shield className="h-3 w-3 text-amber-500" />
-                      <span className="text-[10px] text-amber-500 truncate">
+                      <span className="text-[0.625rem] text-amber-500 truncate">
                         看板数据锁定表，禁止编辑和上传，删除看板时自动删除
                       </span>
                     </div>
@@ -478,7 +510,7 @@ export default function DatabaseView() {
                   {!isSystem && !isLocked && linked.length > 0 && (
                     <div className="flex items-center gap-1 pl-6">
                       <BarChart3 className="h-3 w-3 text-amber-500" />
-                      <span className="text-[10px] text-slate-400 truncate">
+                      <span className="text-[0.625rem] text-slate-400 truncate">
                         关联看板: {linked.map((d) => d.name).join(", ")}
                       </span>
                     </div>
@@ -488,6 +520,12 @@ export default function DatabaseView() {
             })}
           </div>
         </ScrollArea>
+        {/* 拖拽调整宽度 */}
+        <div
+          className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-blue-400 active:bg-blue-600 transition-colors z-10"
+          onMouseDown={handleResizeStart}
+          title="拖拽调整宽度"
+        />
       </div>
 
       {/* 右侧详情 */}
@@ -632,7 +670,7 @@ export default function DatabaseView() {
                           )}
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="text-[10px]">
+                          <Badge variant="outline" className="text-[0.625rem]">
                             {col.type || "TEXT"}
                           </Badge>
                         </TableCell>
@@ -648,7 +686,7 @@ export default function DatabaseView() {
                         </TableCell>
                         <TableCell>
                           {col.pk && (
-                            <Badge className="text-[10px] bg-amber-100 text-amber-700 hover:bg-amber-100">
+                            <Badge className="text-[0.625rem] bg-amber-100 text-amber-700 hover:bg-amber-100">
                               PK
                             </Badge>
                           )}
@@ -692,7 +730,7 @@ export default function DatabaseView() {
                             <div className="flex flex-col">
                               <span>{col}</span>
                               {remarks[col] && (
-                                <span className="text-[10px] text-slate-400 font-normal">
+                                <span className="text-[0.625rem] text-slate-400 font-normal">
                                   {remarks[col]}
                                 </span>
                               )}

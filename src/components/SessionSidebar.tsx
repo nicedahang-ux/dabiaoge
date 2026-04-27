@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Plus, MessageSquare, Trash2, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -24,6 +24,36 @@ export default function SessionSidebar({
 }: SessionSidebarProps) {
   const { sessions, currentSessionId, refreshSessions } = useApp();
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [width, setWidth] = useState(() => {
+    try {
+      const raw = localStorage.getItem("session_sidebar_width");
+      return raw ? Math.max(180, Math.min(400, parseInt(raw, 10))) : 220;
+    } catch {
+      return 220;
+    }
+  });
+
+  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = width;
+    let currentWidth = startWidth;
+
+    const onMove = (e: MouseEvent) => {
+      currentWidth = Math.max(180, Math.min(400, startWidth + e.clientX - startX));
+      setWidth(currentWidth);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      try {
+        localStorage.setItem("session_sidebar_width", String(currentWidth));
+      } catch {}
+    };
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [width]);
 
   useEffect(() => {
     refreshSessions();
@@ -44,7 +74,7 @@ export default function SessionSidebar({
   };
 
   return (
-    <div className="w-[220px] border-r bg-slate-50 flex flex-col h-full">
+    <div className="border-r bg-slate-50 flex flex-col h-full relative" style={{ width }}>
       <div className="p-3 border-b flex items-center justify-between">
         <span className="text-sm font-medium text-slate-700">会话历史</span>
         <Button
@@ -90,7 +120,7 @@ export default function SessionSidebar({
                 <div className="truncate text-xs font-medium">
                   {session.title}
                 </div>
-                <div className="text-[10px] text-slate-400 truncate">
+                <div className="text-[0.625rem] text-slate-400 truncate">
                   {session.messages.length} 条消息 ·
                   {session.token_count.toLocaleString()} tokens
                 </div>
@@ -128,6 +158,12 @@ export default function SessionSidebar({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {/* 拖拽调整宽度 */}
+      <div
+        className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-blue-400 active:bg-blue-600 transition-colors z-10"
+        onMouseDown={handleResizeStart}
+        title="拖拽调整宽度"
+      />
     </div>
   );
 }
