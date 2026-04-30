@@ -267,7 +267,7 @@ async fn run_bot_loop(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-async fn get_dingtalk_token(config: &AppConfig) -> Result<String, String> {
+pub async fn get_dingtalk_token(config: &AppConfig) -> Result<String, String> {
     let client = reqwest::Client::new();
     // CorpSecret 和 AppSecret 是不同的凭证，这里始终使用 AppKey + AppSecret
     let url = format!(

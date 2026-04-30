@@ -40,8 +40,43 @@ export interface Dashboard {
   actions?: string;
   summary_cards?: string;
   html_content?: string;
+  source_type?: string;
+  dingtalk_doc_url?: string;
+  dingtalk_doc_id?: string;
+  dingtalk_last_sync?: string;
+  dingtalk_operator_id?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface ScheduleConfig {
+  time: string;
+  days?: number[];
+  interval_days?: number;
+  date?: string;
+}
+
+export interface Schedule {
+  id: string;
+  dashboard_id: string;
+  prompt: string;
+  schedule_type: 'once' | 'daily' | 'weekly' | 'monthly' | 'interval';
+  schedule_config: string;
+  webhook_url: string;
+  task_type: 'analysis' | 'sync';
+  sync_mode: 'overwrite' | 'append';
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleLog {
+  id: number;
+  schedule_id: string;
+  status: 'success' | 'failed';
+  result?: string;
+  error?: string;
+  created_at: string;
 }
 
 export interface NewFileSpec {

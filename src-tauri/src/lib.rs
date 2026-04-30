@@ -3,8 +3,11 @@ mod chart_gen;
 mod server;
 
 use calamine::Reader;
+use chrono::{Datelike, Timelike};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::sync::Mutex;
 use tauri::Emitter;
 use uuid::Uuid;
 
@@ -17,6 +20,8 @@ pub struct AppConfig {
     pub ding_app_key: String,
     pub ding_app_secret: String,
 }
+
+static CONFIG_CACHE: Lazy<Mutex<AppConfig>> = Lazy::new(|| Mutex::new(AppConfig::default()));
 
 #[derive(Serialize, Deserialize, Clone)]
 struct PersistedShareInfo {
@@ -42,19 +47,28 @@ async fn save_config(app: tauri::AppHandle, config: AppConfig) -> Result<(), Str
     let store = app_store(&app)?;
     store.set(STORE_KEY, serde_json::to_value(&config).unwrap());
     store.save().map_err(|e| format!("存储配置失败: {}", e))?;
+    // 更新内存缓存
+    if let Ok(mut cache) = CONFIG_CACHE.lock() {
+        *cache = config;
+    }
     Ok(())
 }
 
 #[tauri::command]
 async fn load_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
     let store = app_store(&app)?;
-    match store.get(STORE_KEY) {
+    let cfg = match store.get(STORE_KEY) {
         Some(v) => {
-            let cfg: AppConfig = serde_json::from_value(v.clone()).unwrap_or_default();
-            Ok(cfg)
+            let c: AppConfig = serde_json::from_value(v.clone()).unwrap_or_default();
+            c
         }
-        None => Ok(AppConfig::default()),
+        None => AppConfig::default(),
+    };
+    // 更新内存缓存
+    if let Ok(mut cache) = CONFIG_CACHE.lock() {
+        *cache = cfg.clone();
     }
+    Ok(cfg)
 }
 
 async fn save_share_status(app: tauri::AppHandle, info: PersistedShareInfo) -> Result<(), String> {
@@ -1135,6 +1149,11 @@ fn init_db() -> Result<rusqlite::Connection, String> {
         ("actions", "TEXT"),
         ("summary_cards", "TEXT"),
         ("html_content", "TEXT"),
+        ("source_type", "TEXT"),
+        ("dingtalk_doc_url", "TEXT"),
+        ("dingtalk_doc_id", "TEXT"),
+        ("dingtalk_last_sync", "TEXT"),
+        ("dingtalk_operator_id", "TEXT"),
     ];
     for (col, typ) in needed_cols {
         if !existing_cols.contains(col) {
@@ -1222,6 +1241,59 @@ fn init_db() -> Result<rusqlite::Connection, String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    // 看板定时任务表
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_schedules (
+            id TEXT PRIMARY KEY,
+            dashboard_id TEXT NOT NULL,
+            prompt TEXT NOT NULL DEFAULT '',
+            schedule_type TEXT NOT NULL,
+            schedule_config TEXT NOT NULL DEFAULT '{}',
+            webhook_url TEXT NOT NULL DEFAULT '',
+            task_type TEXT NOT NULL DEFAULT 'analysis',
+            sync_mode TEXT NOT NULL DEFAULT 'overwrite',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 看板定时任务执行日志表
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dashboard_schedule_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result TEXT,
+            error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 迁移：为 dashboard_schedules 表添加 task_type 和 sync_mode 字段
+    let schedule_cols = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(dashboard_schedules)")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok())
+            .collect::<std::collections::HashSet<String>>()
+    };
+    for (col, typ) in [("task_type", "TEXT"), ("sync_mode", "TEXT")] {
+        if !schedule_cols.contains(col) {
+            let sql = format!("ALTER TABLE dashboard_schedules ADD COLUMN {} {}", col, typ);
+            if let Err(e) = conn.execute(&sql, []) {
+                eprintln!("[DB MIGRATE] 添加 dashboard_schedules.{} 失败: {}", col, e);
+            }
+        }
+    }
 
     Ok(conn)
 }
@@ -1360,6 +1432,11 @@ pub struct Dashboard {
     pub actions: Option<String>,
     pub summary_cards: Option<String>,
     pub html_content: Option<String>,
+    pub source_type: Option<String>,
+    pub dingtalk_doc_url: Option<String>,
+    pub dingtalk_doc_id: Option<String>,
+    pub dingtalk_last_sync: Option<String>,
+    pub dingtalk_operator_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1376,13 +1453,16 @@ async fn create_dashboard(
     actions: Option<String>,
     summary_cards: Option<String>,
     html_content: Option<String>,
+    source_type: Option<String>,
+    dingtalk_doc_url: Option<String>,
+    dingtalk_doc_id: Option<String>,
 ) -> Result<String, String> {
     let conn = init_db()?;
     let id = Uuid::new_v4().to_string();
 
     conn.execute(
-        "INSERT INTO dashboards (id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        rusqlite::params![id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content],
+        "INSERT INTO dashboards (id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, source_type, dingtalk_doc_url, dingtalk_doc_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        rusqlite::params![id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, source_type, dingtalk_doc_url, dingtalk_doc_id],
     )
     .map_err(|e| e.to_string())?;
 
@@ -1393,7 +1473,7 @@ async fn create_dashboard(
 async fn get_dashboards() -> Result<Vec<Dashboard>, String> {
     let conn = init_db()?;
     let mut stmt = conn
-        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at FROM dashboards ORDER BY updated_at DESC")
+        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, source_type, dingtalk_doc_url, dingtalk_doc_id, dingtalk_last_sync, dingtalk_operator_id, created_at, updated_at FROM dashboards ORDER BY updated_at DESC")
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -1410,6 +1490,11 @@ async fn get_dashboards() -> Result<Vec<Dashboard>, String> {
                 actions: row.get("actions")?,
                 summary_cards: row.get("summary_cards")?,
                 html_content: row.get("html_content")?,
+                source_type: row.get("source_type")?,
+                dingtalk_doc_url: row.get("dingtalk_doc_url")?,
+                dingtalk_doc_id: row.get("dingtalk_doc_id")?,
+                dingtalk_last_sync: row.get("dingtalk_last_sync")?,
+                dingtalk_operator_id: row.get("dingtalk_operator_id")?,
                 created_at: row.get("created_at")?,
                 updated_at: row.get("updated_at")?,
             })
@@ -1427,7 +1512,7 @@ async fn get_dashboards() -> Result<Vec<Dashboard>, String> {
 async fn get_dashboard(id: String) -> Result<Dashboard, String> {
     let conn = init_db()?;
     let mut stmt = conn
-        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at FROM dashboards WHERE id = ?1")
+        .prepare("SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, source_type, dingtalk_doc_url, dingtalk_doc_id, dingtalk_last_sync, dingtalk_operator_id, created_at, updated_at FROM dashboards WHERE id = ?1")
         .map_err(|e| e.to_string())?;
 
     let row = stmt
@@ -1444,6 +1529,11 @@ async fn get_dashboard(id: String) -> Result<Dashboard, String> {
                 actions: row.get("actions")?,
                 summary_cards: row.get("summary_cards")?,
                 html_content: row.get("html_content")?,
+                source_type: row.get("source_type")?,
+                dingtalk_doc_url: row.get("dingtalk_doc_url")?,
+                dingtalk_doc_id: row.get("dingtalk_doc_id")?,
+                dingtalk_last_sync: row.get("dingtalk_last_sync")?,
+                dingtalk_operator_id: row.get("dingtalk_operator_id")?,
                 created_at: row.get("created_at")?,
                 updated_at: row.get("updated_at")?,
             })
@@ -1568,11 +1658,16 @@ async fn update_dashboard(
     actions: Option<String>,
     summary_cards: Option<String>,
     html_content: Option<String>,
+    source_type: Option<String>,
+    dingtalk_doc_url: Option<String>,
+    dingtalk_doc_id: Option<String>,
+    dingtalk_last_sync: Option<String>,
+    dingtalk_operator_id: Option<String>,
 ) -> Result<(), String> {
     let conn = init_db()?;
 
     let current: Dashboard = conn.query_row(
-        "SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, created_at, updated_at FROM dashboards WHERE id = ?1",
+        "SELECT id, name, description, sql_template, ui_filters, charts, table_data, source_table, actions, summary_cards, html_content, source_type, dingtalk_doc_url, dingtalk_doc_id, dingtalk_last_sync, dingtalk_operator_id, created_at, updated_at FROM dashboards WHERE id = ?1",
         [&id],
         |row| Ok(Dashboard {
             id: row.get("id")?,
@@ -1586,6 +1681,11 @@ async fn update_dashboard(
             actions: row.get("actions")?,
             summary_cards: row.get("summary_cards")?,
             html_content: row.get("html_content")?,
+            source_type: row.get("source_type")?,
+            dingtalk_doc_url: row.get("dingtalk_doc_url")?,
+            dingtalk_doc_id: row.get("dingtalk_doc_id")?,
+            dingtalk_last_sync: row.get("dingtalk_last_sync")?,
+            dingtalk_operator_id: row.get("dingtalk_operator_id")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         }),
@@ -1609,6 +1709,11 @@ async fn update_dashboard(
     let new_actions = actions.filter(|s| !s.is_empty() && s != "[]").or(current.actions.clone());
     let new_summary_cards = summary_cards.filter(|s| !s.is_empty() && s != "[]").or(current.summary_cards.clone());
     let new_html_content = html_content.filter(|s| !s.is_empty()).or(current.html_content.clone());
+    let new_source_type = source_type.filter(|s| !s.is_empty()).or(current.source_type.clone());
+    let new_dingtalk_doc_url = dingtalk_doc_url.filter(|s| !s.is_empty()).or(current.dingtalk_doc_url.clone());
+    let new_dingtalk_doc_id = dingtalk_doc_id.filter(|s| !s.is_empty()).or(current.dingtalk_doc_id.clone());
+    let new_dingtalk_last_sync = dingtalk_last_sync.filter(|s| !s.is_empty()).or(current.dingtalk_last_sync.clone());
+    let new_dingtalk_operator_id = dingtalk_operator_id.filter(|s| !s.is_empty()).or(current.dingtalk_operator_id.clone());
 
     // 保存快照（只要任一关键字段发生变化）
     let changed = new_sql.as_ref() != current.sql_template.as_ref()
@@ -1631,8 +1736,8 @@ async fn update_dashboard(
     }
 
     conn.execute(
-        "UPDATE dashboards SET name = ?1, description = ?2, sql_template = ?3, ui_filters = ?4, charts = ?5, table_data = ?6, source_table = ?7, actions = ?8, summary_cards = ?9, html_content = ?10, updated_at = CURRENT_TIMESTAMP WHERE id = ?11",
-        rusqlite::params![new_name, new_description, new_sql, new_filters, new_charts, new_table_data, new_source_table, new_actions, new_summary_cards, new_html_content, id],
+        "UPDATE dashboards SET name = ?1, description = ?2, sql_template = ?3, ui_filters = ?4, charts = ?5, table_data = ?6, source_table = ?7, actions = ?8, summary_cards = ?9, html_content = ?10, source_type = ?11, dingtalk_doc_url = ?12, dingtalk_doc_id = ?13, dingtalk_last_sync = ?14, dingtalk_operator_id = ?15, updated_at = CURRENT_TIMESTAMP WHERE id = ?16",
+        rusqlite::params![new_name, new_description, new_sql, new_filters, new_charts, new_table_data, new_source_table, new_actions, new_summary_cards, new_html_content, new_source_type, new_dingtalk_doc_url, new_dingtalk_doc_id, new_dingtalk_last_sync, new_dingtalk_operator_id, id],
     ).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1662,6 +1767,1626 @@ async fn delete_dashboard(id: String) -> Result<(), String> {
     conn.execute("DELETE FROM dashboard_revisions WHERE dashboard_id = ?1", [&id])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ========== Dashboard Schedule ==========
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DashboardSchedule {
+    pub id: String,
+    pub dashboard_id: String,
+    pub prompt: String,
+    pub schedule_type: String,
+    pub schedule_config: String,
+    pub webhook_url: String,
+    pub task_type: String,
+    pub sync_mode: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ScheduleConfig {
+    pub time: String,
+    #[serde(default)]
+    pub days: Vec<u8>,
+    #[serde(default)]
+    pub interval_days: Option<u32>,
+    #[serde(default)]
+    pub date: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ScheduleLog {
+    pub id: i64,
+    pub schedule_id: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[tauri::command]
+async fn create_schedule(
+    dashboard_id: String,
+    prompt: String,
+    schedule_type: String,
+    schedule_config: String,
+    webhook_url: String,
+    task_type: Option<String>,
+    sync_mode: Option<String>,
+) -> Result<String, String> {
+    let conn = init_db()?;
+    let id = Uuid::new_v4().to_string();
+    let task = task_type.unwrap_or_else(|| "analysis".to_string());
+    let sync = sync_mode.unwrap_or_else(|| "overwrite".to_string());
+    conn.execute(
+        "INSERT INTO dashboard_schedules (id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task_type, sync_mode, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+        rusqlite::params![id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task, sync],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+async fn update_schedule(
+    id: String,
+    prompt: String,
+    schedule_type: String,
+    schedule_config: String,
+    webhook_url: String,
+    enabled: bool,
+    task_type: Option<String>,
+    sync_mode: Option<String>,
+) -> Result<(), String> {
+    let conn = init_db()?;
+    let enabled_i = if enabled { 1 } else { 0 };
+    let task = task_type.unwrap_or_else(|| "analysis".to_string());
+    let sync = sync_mode.unwrap_or_else(|| "overwrite".to_string());
+    conn.execute(
+        "UPDATE dashboard_schedules SET prompt = ?1, schedule_type = ?2, schedule_config = ?3, webhook_url = ?4, enabled = ?5, task_type = ?6, sync_mode = ?7, updated_at = CURRENT_TIMESTAMP WHERE id = ?8",
+        rusqlite::params![prompt, schedule_type, schedule_config, webhook_url, enabled_i, task, sync, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_schedule(id: String) -> Result<(), String> {
+    let conn = init_db()?;
+    conn.execute("DELETE FROM dashboard_schedules WHERE id = ?1", [&id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM dashboard_schedule_logs WHERE schedule_id = ?1", [&id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_schedules(dashboard_id: Option<String>) -> Result<Vec<DashboardSchedule>, String> {
+    let conn = init_db()?;
+    let (sql, params): (String, Vec<&dyn rusqlite::ToSql>) = if let Some(did) = &dashboard_id {
+        (
+            "SELECT id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task_type, sync_mode, enabled, created_at, updated_at FROM dashboard_schedules WHERE dashboard_id = ?1 ORDER BY updated_at DESC".to_string(),
+            vec![did as &dyn rusqlite::ToSql],
+        )
+    } else {
+        (
+            "SELECT id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task_type, sync_mode, enabled, created_at, updated_at FROM dashboard_schedules ORDER BY updated_at DESC".to_string(),
+            vec![],
+        )
+    };
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(DashboardSchedule {
+                id: row.get(0)?,
+                dashboard_id: row.get(1)?,
+                prompt: row.get(2)?,
+                schedule_type: row.get(3)?,
+                schedule_config: row.get(4)?,
+                webhook_url: row.get(5)?,
+                task_type: row.get(6)?,
+                sync_mode: row.get(7)?,
+                enabled: row.get::<_, i64>(8).map(|v| v == 1).unwrap_or(true),
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut schedules = vec![];
+    for row in rows {
+        schedules.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(schedules)
+}
+
+#[tauri::command]
+async fn get_schedule_logs(schedule_id: String, limit: Option<i64>) -> Result<Vec<ScheduleLog>, String> {
+    let conn = init_db()?;
+    let limit = limit.unwrap_or(20);
+    let mut stmt = conn
+        .prepare("SELECT id, schedule_id, status, result, error, created_at FROM dashboard_schedule_logs WHERE schedule_id = ?1 ORDER BY created_at DESC LIMIT ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![schedule_id, limit], |row| {
+            Ok(ScheduleLog {
+                id: row.get(0)?,
+                schedule_id: row.get(1)?,
+                status: row.get(2)?,
+                result: row.get(3)?,
+                error: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut logs = vec![];
+    for row in rows {
+        logs.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(logs)
+}
+
+fn should_run_now(schedule: &DashboardSchedule) -> bool {
+    let config: ScheduleConfig = match serde_json::from_str(&schedule.schedule_config) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let now = chrono::Local::now();
+    let target_time = match chrono::NaiveTime::parse_from_str(&config.time, "%H:%M") {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // 匹配到分钟级别即可（轮询每60秒一次）
+    if now.minute() != target_time.minute() || now.hour() != target_time.hour() {
+        return false;
+    }
+
+    match schedule.schedule_type.as_str() {
+        "once" => {
+            if let Some(date_str) = config.date {
+                if let Ok(target_date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                    return now.date_naive() == target_date;
+                }
+            }
+            false
+        }
+        "daily" => true,
+        "weekly" => {
+            let weekday = now.weekday().number_from_monday() as u8;
+            config.days.contains(&weekday)
+        }
+        "monthly" => {
+            let day = now.day() as u8;
+            config.days.contains(&day)
+        }
+        "interval" => {
+            if let Some(interval) = config.interval_days {
+                if interval == 0 {
+                    return false;
+                }
+                // 查询上次成功执行时间
+                if let Ok(conn) = init_db() {
+                    let last_run: Option<String> = conn
+                        .query_row(
+                            "SELECT created_at FROM dashboard_schedule_logs WHERE schedule_id = ?1 AND status = 'success' ORDER BY created_at DESC LIMIT 1",
+                            [&schedule.id],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(last_str) = last_run {
+                        if let Ok(last_dt) = chrono::NaiveDateTime::parse_from_str(&last_str, "%Y-%m-%d %H:%M:%S") {
+                            let days_since = now.naive_local().signed_duration_since(last_dt).num_days();
+                            return days_since >= interval as i64;
+                        }
+                    } else {
+                        // 从未执行过，允许执行
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+
+static RUNNING_SCHEDULES: once_cell::sync::Lazy<Arc<TokioMutex<std::collections::HashSet<String>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(TokioMutex::new(std::collections::HashSet::new())));
+
+async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) {
+    let schedule_id = schedule.id.clone();
+    let dashboard_id = schedule.dashboard_id.clone();
+    let prompt = schedule.prompt.clone();
+    let webhook_url = schedule.webhook_url.clone();
+    let task_type = schedule.task_type.clone();
+    let sync_mode = schedule.sync_mode.clone();
+
+    println!("[Scheduler] 开始执行任务 {} 看板 {} 类型 {}", schedule_id, dashboard_id, task_type);
+
+    // 1. 获取看板信息
+    let dashboard = match get_dashboard(dashboard_id.clone()).await {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("获取看板失败: {}", e))).await;
+            return;
+        }
+    };
+
+    if task_type == "sync" {
+        // ========== 数据同步任务 ==========
+        let doc_url = match dashboard.dingtalk_doc_url {
+            Some(u) => u,
+            None => {
+                let _ = log_schedule_run(&schedule_id, "failed", None, Some("看板没有关联钉钉文档")).await;
+                return;
+            }
+        };
+        let doc_type = parse_dingtalk_url(&doc_url).map(|(t, _)| t).unwrap_or("sheet");
+
+        let op_id = dashboard.dingtalk_operator_id.clone().unwrap_or_default();
+
+        let token = match get_dingtalk_token_from_config().await {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("获取Token失败: {}", e))).await;
+                return;
+            }
+        };
+
+        let data = if doc_type == "bitable" {
+            if op_id.is_empty() {
+                let _ = log_schedule_run(&schedule_id, "failed", None, Some("同步钉钉多维表需要提供 OPERATOR_ID")).await;
+                return;
+            }
+            match fetch_dingtalk_bitable_data(&token, &doc_url, &op_id).await {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("获取多维表数据失败: {}", e))).await;
+                    return;
+                }
+            }
+        } else {
+            match fetch_dingtalk_sheet_data(&token, &doc_url).await {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("获取表格数据失败: {}", e))).await;
+                    return;
+                }
+            }
+        };
+
+        let table_name = match dashboard.source_table {
+            Some(t) => t,
+            None => {
+                let _ = log_schedule_run(&schedule_id, "failed", None, Some("看板没有关联数据表")).await;
+                return;
+            }
+        };
+
+        let conn = match init_db() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("数据库连接失败: {}", e))).await;
+                return;
+            }
+        };
+
+        let count = match insert_data_into_table(&conn, &table_name, data, &sync_mode) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("写入数据失败: {}", e))).await;
+                return;
+            }
+        };
+
+        // 更新最后同步时间
+        let _ = conn.execute(
+            "UPDATE dashboards SET dingtalk_last_sync = datetime('now','localtime') WHERE id = ?1",
+            [&dashboard_id],
+        );
+
+        let result_msg = format!("同步成功，共写入 {} 条记录 (模式: {})", count, sync_mode);
+
+        // 如果配置了 webhook，发送同步完成通知
+        if !webhook_url.is_empty() {
+            let notify_md = format!(
+                "## 数据同步完成\n\n- 看板：{}\n- 同步模式：{}\n- 写入记录数：{}\n- 同步时间：{}",
+                dashboard.name,
+                sync_mode,
+                count,
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+            );
+            if let Err(e) = send_dingtalk_webhook(&webhook_url, &notify_md, &[]).await {
+                eprintln!("[Scheduler] 同步通知发送失败: {}", e);
+            }
+        }
+
+        let _ = log_schedule_run(&schedule_id, "success", Some(&result_msg), None).await;
+        println!("[Scheduler] 同步任务 {} 执行成功，写入 {} 条", schedule_id, count);
+        return;
+    }
+
+    // ========== AI 分析任务 ==========
+    // 2. 确定数据源
+    let (table_name, data_markdown) = match resolve_dashboard_data(&dashboard, &prompt
+    ).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("解析数据失败: {}", e))).await;
+            return;
+        }
+    };
+
+    // 3. 调用 AI 分析
+    let analysis_result = match analyze_with_ai(&prompt, &data_markdown, &table_name, None
+    ).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("AI分析失败: {}", e))).await;
+            return;
+        }
+    };
+
+    // 4. 生成图表
+    let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
+    let (content_with_images, image_urls) = match crate::chart_gen::process_tables_into_charts(
+        &analysis_result,
+        &temp_dir,
+    )
+    .await
+    {
+        Ok((content, urls)) => (content, urls),
+        Err(e) => {
+            eprintln!("[Scheduler] 图表生成失败: {}", e);
+            (analysis_result.clone(), vec![])
+        }
+    };
+
+    // 5. 发送钉钉
+    if let Err(e) = send_dingtalk_webhook(&webhook_url, &content_with_images, &image_urls
+    )
+    .await
+    {
+        let _ = log_schedule_run(
+            &schedule_id,
+            "failed",
+            Some(&analysis_result),
+            Some(&format!("发送钉钉失败: {}", e)),
+        )
+        .await;
+        return;
+    }
+
+    let _ = log_schedule_run(
+        &schedule_id,
+        "success",
+        Some(&analysis_result),
+        None,
+    )
+    .await;
+    println!("[Scheduler] 任务 {} 执行成功", schedule_id);
+}
+
+async fn log_schedule_run(
+    schedule_id: &str,
+    status: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let conn = init_db()?;
+    conn.execute(
+        "INSERT INTO dashboard_schedule_logs (schedule_id, status, result, error) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![schedule_id, status, result, error],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn check_and_run_schedules(app: tauri::AppHandle) {
+    let schedules = match get_schedules(None).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Scheduler] 获取定时任务失败: {}", e);
+            return;
+        }
+    };
+
+    let now = chrono::Local::now();
+    println!(
+        "[Scheduler] {} 检查 {} 个定时任务",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        schedules.len()
+    );
+
+    for schedule in schedules {
+        if !schedule.enabled {
+            continue;
+        }
+        if !should_run_now(&schedule) {
+            continue;
+        }
+
+        let running = RUNNING_SCHEDULES.clone();
+        let id = schedule.id.clone();
+        {
+            let mut set = running.lock().await;
+            if set.contains(&id) {
+                println!("[Scheduler] 任务 {} 正在执行中，跳过", id);
+                continue;
+            }
+            set.insert(id.clone());
+        }
+
+        let app_clone = app.clone();
+        let schedule_clone = schedule.clone();
+        tauri::async_runtime::spawn(async move {
+            run_schedule_task(app_clone, schedule_clone).await;
+            let mut set = running.lock().await;
+            set.remove(&id);
+        });
+    }
+}
+
+async fn resolve_dashboard_data(
+    dashboard: &Dashboard,
+    _prompt: &str,
+) -> Result<(String, String), String> {
+    let conn = init_db()?;
+
+    // 优先使用 source_table
+    let table_name = if let Some(ref st) = dashboard.source_table {
+        st.clone()
+    } else {
+        return Err("看板没有关联数据表".to_string());
+    };
+
+    // 统计行数列数
+    let count_sql = format!("SELECT COUNT(*) FROM \"{}\"", table_name);
+    let row_count: i64 = conn
+        .query_row(&count_sql, [], |row| row.get(0)
+        )
+        .map_err(|e| format!("统计行数失败: {}", e))?;
+
+    let col_sql = format!("PRAGMA table_info({})", table_name);
+    let mut col_stmt = conn.prepare(&col_sql).map_err(|e| e.to_string())?;
+    let col_count = col_stmt.column_count();
+    // PRAGMA table_info 返回的是行数，需要用 query_map 统计
+    let mut actual_col_count = 0i64;
+    let rows = col_stmt.query_map([], |_row| {
+        actual_col_count += 1;
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    for _ in rows {}
+    drop(col_stmt);
+
+    println!(
+        "[Scheduler] 表 {} 行数: {}, 列数: {}",
+        table_name, row_count, actual_col_count
+    );
+
+    if row_count <= 50 && actual_col_count <= 30 {
+        // 直接获取全部数据
+        let sql = format!(r#"SELECT * FROM "{}""#, table_name);
+        let query_result = run_sql_query(&sql)?;
+        let markdown = query_result_to_markdown(&query_result);
+        Ok((table_name, markdown))
+    } else {
+        // 获取前20行
+        let preview_sql = format!(r#"SELECT * FROM "{}" LIMIT 20"#, table_name);
+        let preview_result = run_sql_query(&preview_sql)?;
+        let preview_md = query_result_to_markdown(&preview_result);
+        let schema = collect_schema_summary();
+        let context = format!(
+            "【表结构说明】\n{}\n\n【数据预览（前20行）】\n{}\n\n请根据用户要求，写SQLite查询语句来分析数据。",
+            schema, preview_md
+        );
+        Ok((table_name, context))
+    }
+}
+
+fn query_result_to_markdown(result: &QueryResult) -> String {
+    let mut lines = vec![];
+    lines.push(
+        format!("| {} |", result.columns.join(" | ")));
+    lines.push(
+        format!("|{}|", result.columns.iter().map(|_| " --- ").collect::<Vec<_>>().join("|")),
+    );
+    for row in &result.rows {
+        lines.push(format!("| {} |", row.join(" | ")));
+    }
+    lines.join("\n")
+}
+
+async fn analyze_with_ai(
+    prompt: &str,
+    data_markdown: &str,
+    table_name: &str,
+    system_prompt_override: Option<&str>,
+) -> Result<String, String> {
+    let config = load_config_db()?;
+    let client = reqwest::Client::new();
+    let url = format!("{}/chat/completions", config.ai_url.trim_end_matches('/'));
+
+    let system_prompt = system_prompt_override.map(|s| s.to_string()).unwrap_or_else(|| format!(
+        r#"你是企业数据分析师。请根据提供的数据，按照用户的要求生成图文分析报告。
+要求：
+1. 用大白话解释数据，不要讲技术术语
+2. 数据结果用 Markdown 表格呈现
+3. 适当加 emoji 让报告更生动
+4. 如果有趋势或对比，主动指出洞察
+当前分析的表名：{}"#,
+        table_name
+    ));
+
+    let user_content = format!(
+        "【用户分析要求】\n{}\n\n【数据】\n{}\n\n请生成分析报告：",
+        prompt, data_markdown
+    );
+
+    let req_body = serde_json::json!({
+        "model": config.ai_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.3,
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", config.ai_key))
+        .json(&req_body)
+        .send()
+        .await
+        .map_err(|e| format!("AI请求失败: {}", e))?;
+
+    let status = resp.status();
+    let body = resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("AI响应解析失败: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("AI接口错误: {:?}", body));
+    }
+
+    let content = body
+        .get("choices")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(content)
+}
+
+fn load_config_db() -> Result<AppConfig, String> {
+    // 从内存缓存中读取配置（调度器内部使用）
+    let cache = CONFIG_CACHE.lock().map_err(|e| format!("配置锁错误: {}", e))?;
+    Ok(cache.clone())
+}
+
+async fn send_dingtalk_webhook(
+    webhook_url: &str,
+    content: &str,
+    image_urls: &[ String],
+) -> Result<(), String> {
+    if webhook_url.is_empty() {
+        return Err("Webhook 地址为空".to_string());
+    }
+    let client = reqwest::Client::new();
+
+    let markdown_text = if image_urls.is_empty() {
+        content.to_string()
+    } else {
+        let mut text = content.to_string();
+        for url in image_urls {
+            text.push_str(&format!("\n\n![图表]({})", url));
+        }
+        text
+    };
+
+    let body = serde_json::json!({
+        "msgtype": "markdown",
+        "markdown": {
+            "title": "数据定时报告",
+            "text": markdown_text
+        }
+    });
+
+    let resp = client
+        .post(webhook_url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Webhook 发送失败: {}", e))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    println!("Webhook 回复响应: {} {}", status, text);
+
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("Webhook 回复失败: {} {}", status, text))
+    }
+}
+
+#[tauri::command]
+async fn test_schedule_run(
+    dashboard_id: String,
+    prompt: String,
+    webhook_url: String,
+    task_type: Option<String>,
+    sync_mode: Option<String>,
+) -> Result<String, String> {
+    let task = task_type.unwrap_or_else(|| "analysis".to_string());
+    let sync = sync_mode.unwrap_or_else(|| "overwrite".to_string());
+
+    let schedule = DashboardSchedule {
+        id: "test".to_string(),
+        dashboard_id,
+        prompt,
+        schedule_type: "once".to_string(),
+        schedule_config: "{}".to_string(),
+        webhook_url,
+        task_type: task.clone(),
+        sync_mode: sync.clone(),
+        enabled: true,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+
+    if task == "sync" {
+        // 测试同步：直接调用同步逻辑
+        let dashboard = get_dashboard(schedule.dashboard_id.clone()).await?;
+        let doc_url = dashboard.dingtalk_doc_url.ok_or("看板没有关联钉钉文档")?;
+        let doc_type = parse_dingtalk_url(&doc_url).map(|(t, _)| t).unwrap_or("sheet");
+
+        let op_id = dashboard.dingtalk_operator_id.clone().unwrap_or_default();
+        let token = get_dingtalk_token_from_config().await?;
+
+        let data = if doc_type == "bitable" {
+            if op_id.is_empty() {
+                return Err("同步钉钉多维表需要提供 OPERATOR_ID".to_string());
+            }
+            fetch_dingtalk_bitable_data(&token, &doc_url, &op_id).await?
+        } else {
+            fetch_dingtalk_sheet_data(&token, &doc_url).await?
+        };
+
+        let table_name = dashboard.source_table.ok_or("看板没有关联数据表")?;
+        let conn = init_db()?;
+        let count = insert_data_into_table(&conn, &table_name, data, &sync)?;
+
+        conn.execute(
+            "UPDATE dashboards SET dingtalk_last_sync = datetime('now','localtime') WHERE id = ?1",
+            [&schedule.dashboard_id],
+        ).map_err(|e| e.to_string())?;
+
+        return Ok(format!("同步测试成功，共写入 {} 条记录 (模式: {})", count, sync));
+    }
+
+    // 测试分析：直接执行核心逻辑
+    let dashboard = get_dashboard(schedule.dashboard_id.clone()).await?;
+    let (table_name, data_markdown) = resolve_dashboard_data(&dashboard, &schedule.prompt
+    ).await?;
+
+    let analysis_result = analyze_with_ai(
+        &schedule.prompt,
+        &data_markdown,
+        &table_name,
+        None,
+    ).await?;
+
+    let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
+    let (content_with_images, image_urls) = match crate::chart_gen::process_tables_into_charts(
+        &analysis_result,
+        &temp_dir,
+    )
+    .await
+    {
+        Ok((content, urls)) => (content, urls),
+        Err(e) => {
+            eprintln!("[Test] 图表生成失败: {}", e);
+            (analysis_result.clone(), vec![])
+        }
+    };
+
+    send_dingtalk_webhook(&schedule.webhook_url, &content_with_images, &image_urls
+    ).await?;
+
+    Ok("测试发送成功，请检查钉钉".to_string())
+}
+
+// ========== DingTalk Sheet Integration ==========
+
+fn parse_dingtalk_url(url: &str) -> Option<(&str, &str)> {
+    // 在线表格: https://alidocs.dingtalk.com/i/xxx
+    // 多维表格: https://alidocs.dingtalk.com/i/xxx?table=yyy
+    // 纯ID输入: 直接当作多维表 baseId
+    if url.contains("alidocs.dingtalk.com") {
+        if url.contains("bitable") || url.contains("table=") {
+            Some(("bitable", url))
+        } else {
+            Some(("sheet", url))
+        }
+    } else if !url.contains("http") && !url.is_empty() {
+        // 用户直接输入 baseId（纯文本ID）
+        Some(("bitable", url))
+    } else {
+        None
+    }
+}
+
+async fn get_dingtalk_token_from_config() -> Result<String, String> {
+    let config = load_config_db()?;
+    crate::bot::get_dingtalk_token(&config).await
+}
+
+/// 从钉钉分享链接中提取文档ID
+/// 支持格式:
+/// - https://alidocs.dingtalk.com/i/xxxxx
+/// - https://alidocs.dingtalk.com/i/nodes/xxxxx
+/// - https://alidocs.dingtalk.com/i/sheets/xxxxx
+/// - https://alidocs.dingtalk.com/spreadsheetv2/xxx/edit?docKey=yyy
+fn extract_doc_id_from_url(url: &str) -> Option<String> {
+    // 优先从 query 参数提取 docKey（spreadsheetv2 格式常用）
+    if let Some(doc_key) = url.split("docKey=").nth(1)
+        .and_then(|s| s.split('&').next())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+    {
+        return Some(doc_key);
+    }
+
+    // 支持 /i/xxx, /spreadsheetv2/xxx, /sheets/xxx 等
+    let path = url.split('?').next()?;
+    for prefix in ["/i/", "/spreadsheetv2/", "/sheets/", "/workbook/"] {
+        if let Some(seg) = path.split(prefix).nth(1) {
+            let id = seg.split('/').next()?;
+            if !id.is_empty() && id != "edit" {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    // 兜底：最后一个路径段
+    path.rsplit('/').next()
+        .filter(|s| !s.is_empty() && *s != "edit")
+        .map(|s| s.to_string())
+}
+
+/// 从钉钉多维表格分享链接中提取参数
+fn extract_bitable_params_from_url(url: &str) -> Option<(String, String)> {
+    // 尝试从URL中提取 appToken 和 tableId
+    // 格式通常包含 bitable 或 table=xxx
+    let mut app_token = None;
+    let mut table_id = None;
+
+    for param in url.split('?').nth(1).unwrap_or("").split('&') {
+        if let Some((k, v)) = param.split_once('=') {
+            if k == "appToken" || k == "token" {
+                app_token = Some(v.to_string());
+            } else if k == "table" || k == "tableId" {
+                table_id = Some(v.to_string());
+            }
+        }
+    }
+
+    // 如果URL中没有query参数，尝试从path中提取
+    if app_token.is_none() {
+        if let Some(seg) = url.split("/bitable/").nth(1) {
+            app_token = seg.split('/').next().map(|s| s.to_string());
+        }
+    }
+
+    Some((app_token? , table_id.unwrap_or_else(|| "tbltI2f5B8Y3Bbbb".to_string())))
+}
+
+/// 从钉钉多维表(notable)分享链接中提取 base_id
+/// 支持格式:
+/// - https://alidocs.dingtalk.com/i/nodes/xxxxx (团队空间中的多维表)
+/// - https://alidocs.dingtalk.com/i/bitable/xxxxx
+/// - 包含 baseId=xxx 或 docKey=xxx 的链接
+fn extract_notable_base_id(url: &str) -> Option<String> {
+    // 优先从 query 参数提取
+    for key in ["baseId", "docKey", "appToken"] {
+        if let Some(v) = url.split(&format!("{}=", key)).nth(1)
+            .and_then(|s| s.split('&').next())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(v.to_string());
+        }
+    }
+
+    // 从路径中提取
+    let path = url.split('?').next()?;
+    for prefix in ["/i/", "/nodes/", "/bitable/"] {
+        if let Some(seg) = path.split(prefix).nth(1) {
+            let id = seg.split('/').next()?;
+            if !id.is_empty() && id != "edit" {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    // 兜底
+    path.rsplit('/').next()
+        .filter(|s| !s.is_empty() && *s != "edit")
+        .map(|s| s.to_string())
+}
+
+async fn fetch_dingtalk_sheet_data(token: &str, url: &str) -> Result<Vec<Vec<String>>, String> {
+    let workbook_id = extract_doc_id_from_url(url)
+        .ok_or("无法从链接中提取文档ID，请确保是钉钉在线表格分享链接")?;
+
+    println!("[DingTalk Sheet] workbook_id: {}", workbook_id);
+    let client = reqwest::Client::new();
+
+    // 钉钉在线表格 API 尝试多种端点
+    // 方案1: 新版API (GET /v1.0/doc/workbooks/{id})
+    let info_url = format!("https://api.dingtalk.com/v1.0/doc/workbooks/{}", workbook_id);
+    let info_resp = client
+        .get(&info_url)
+        .header("x-acs-dingtalk-access-token", token)
+        .send()
+        .await;
+
+    println!("[DingTalk Sheet] 尝试新版API: {}", info_url);
+
+    // 如果新版API 404，尝试 spreadsheetv2 专用端点，再尝试旧版TOPAPI
+    let mut use_topapi = match info_resp {
+        Ok(r) if r.status() == 404 => {
+            println!("[DingTalk Sheet] 新版API(workbooks)不存在");
+            true
+        }
+        Ok(r) if !r.status().is_success() => {
+            let text = r.text().await.unwrap_or_default();
+            println!("[DingTalk Sheet] 新版API错误: {}", text);
+            true
+        }
+        Err(e) => {
+            println!("[DingTalk Sheet] 新版API请求失败: {}", e);
+            true
+        }
+        _ => false,
+    };
+
+    // 对于 spreadsheetv2 链接，尝试 spreadsheets 端点
+    if use_topapi && url.contains("/spreadsheetv2/") {
+        let sp_url = format!("https://api.dingtalk.com/v1.0/doc/spreadsheets/{}", workbook_id);
+        let sp_resp = client
+            .get(&sp_url)
+            .header("x-acs-dingtalk-access-token", token)
+            .send()
+            .await;
+        println!("[DingTalk Sheet] 尝试 spreadsheets 端点: {}", sp_url);
+        match sp_resp {
+            Ok(r) if r.status().is_success() => {
+                println!("[DingTalk Sheet] spreadsheets 端点可用，继续执行");
+                use_topapi = false;
+                // TODO: 如果此端点成功，需要实现对应的 sheets/cells 获取逻辑
+                // 目前先回退到TOPAPI，因为 spreadsheets 的 sheet/cell API 路径可能也不同
+            }
+            Ok(r) if r.status() == 404 => {
+                println!("[DingTalk Sheet] spreadsheets 端点也不存在");
+            }
+            Ok(r) => {
+                let text = r.text().await.unwrap_or_default();
+                println!("[DingTalk Sheet] spreadsheets 端点错误: {}", text);
+            }
+            Err(e) => {
+                println!("[DingTalk Sheet] spreadsheets 端点请求失败: {}", e);
+            }
+        }
+    }
+
+    if use_topapi {
+        return fetch_dingtalk_sheet_data_topapi(token, &workbook_id, url).await;
+    }
+
+    // 使用新版API获取Sheet列表
+    let sheet_list_url = format!(
+        "https://api.dingtalk.com/v1.0/doc/workbooks/{}/sheets",
+        workbook_id
+    );
+    let sheet_resp = client
+        .get(&sheet_list_url)
+        .header("x-acs-dingtalk-access-token", token)
+        .send()
+        .await
+        .map_err(|e| format!("查询Sheet列表请求失败: {}", e))?;
+
+    let sheet_status = sheet_resp.status();
+    let sheet_text = sheet_resp.text().await.unwrap_or_default();
+    println!("[DingTalk Sheet] sheets status: {} body: {}", sheet_status, sheet_text);
+
+    if !sheet_status.is_success() {
+        return Err(format!("查询Sheet列表失败: {}", sheet_text));
+    }
+
+    let sheet_json: serde_json::Value = serde_json::from_str(&sheet_text)
+        .map_err(|e| format!("解析Sheet列表失败: {}", e))?;
+
+    let sheets = sheet_json
+        .get("sheets")
+        .and_then(|v| v.as_array())
+        .ok_or("返回数据中没有sheets字段")?;
+
+    if sheets.is_empty() {
+        return Err("文档中没有找到Sheet".to_string());
+    }
+
+    let first_sheet = &sheets[0];
+    let sheet_id = first_sheet
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("Sheet没有id字段")?;
+    let sheet_name = first_sheet
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    println!("[DingTalk Sheet] 使用Sheet: {} ({})", sheet_name, sheet_id);
+
+    // 获取Sheet数据（前500行）
+    let cells_url = format!(
+        "https://api.dingtalk.com/v1.0/doc/workbooks/{}/sheets/{}/cells",
+        workbook_id, sheet_id
+    );
+    let cells_resp = client
+        .get(&cells_url)
+        .header("x-acs-dingtalk-access-token", token)
+        .send()
+        .await
+        .map_err(|e| format!("获取单元格数据请求失败: {}", e))?;
+
+    let cells_status = cells_resp.status();
+    let cells_text = cells_resp.text().await.unwrap_or_default();
+    println!("[DingTalk Sheet] cells status: {} body: {}", cells_status, cells_text);
+
+    if !cells_status.is_success() {
+        return Err(format!("获取单元格数据失败: {}", cells_text));
+    }
+
+    let cells_json: serde_json::Value = serde_json::from_str(&cells_text)
+        .map_err(|e| format!("解析单元格数据失败: {}", e))?;
+
+    parse_sheet_cells(&cells_json)
+}
+
+async fn fetch_dingtalk_sheet_data_topapi(
+    token: &str,
+    workbook_id: &str,
+    url: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    let client = reqwest::Client::new();
+
+    // 钉钉文档(nodes)和智能表格(sheets)使用不同的 docType
+    let is_doc = url.contains("/nodes/");
+    let doc_type = if is_doc { "DOCUMENT" } else { "SHEET" };
+
+    // 旧版TOPAPI: 先查询表格信息（尝试 sheet 接口，spreadsheetv2 使用此接口）
+    let query_url = "https://oapi.dingtalk.com/topapi/dingtalkDoc/sheet/query";
+    let query_body = if url.contains("/spreadsheetv2/") || url.contains("/sheets/") {
+        serde_json::json!({
+            "docKey": workbook_id,
+            "docType": "SHEET"
+        })
+    } else {
+        serde_json::json!({
+            "docKey": workbook_id,
+            "docType": doc_type
+        })
+    };
+    let query_resp = client
+        .post(query_url)
+        .query(&[("access_token", token)])
+        .json(&query_body)
+        .send()
+        .await
+        .map_err(|e| format!("TOPAPI查询文档请求失败: {}", e))?;
+
+    let query_status = query_resp.status();
+    let query_text = query_resp.text().await.unwrap_or_default();
+    println!(
+        "[DingTalk Sheet TOPAPI] query({}) status: {} body: {}",
+        doc_type, query_status, query_text
+    );
+
+    if !query_status.is_success() {
+        return Err(format!("TOPAPI查询文档失败: {}", query_text));
+    }
+
+    let query_json: serde_json::Value = serde_json::from_str(&query_text)
+        .map_err(|e| format!("解析查询响应失败: {}", e))?;
+
+    let errcode = query_json.get("errcode").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if errcode != 0 {
+        let errmsg = query_json
+            .get("errmsg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        // 如果是钉钉文档(nodes)或表格(spreadsheetv2)且接口不合法，提示用户当前不支持
+        if is_doc || url.contains("/spreadsheetv2/") {
+            return Err(format!(
+                "钉钉在线表格/文档暂不支持通过API直接读取数据。\
+                建议：1) 改用钉钉多维表链接; 2) 或将表格导出为Excel/CSV上传。 \
+                (TOPAPI错误 [{}]: {})",
+                errcode, errmsg
+            ));
+        }
+        return Err(format!("TOPAPI错误 [{}]: {}", errcode, errmsg));
+    }
+
+    // 获取sheetId
+    let sheet_id = query_json
+        .get("doc")
+        .and_then(|v| v.get("sheetId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            query_json
+                .get("doc")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or(workbook_id);
+
+    println!("[DingTalk Sheet TOPAPI] sheet_id: {}", sheet_id);
+
+    // 获取表格数据范围
+    let range_url = "https://oapi.dingtalk.com/topapi/dingtalkDoc/sheet/getRangeData";
+    let range_resp = client
+        .post(range_url)
+        .query(&[("access_token", token)])
+        .json(&serde_json::json!({
+            "docKey": workbook_id,
+            "sheetId": sheet_id,
+            "range": {
+                "startRow": 0,
+                "startColumn": 0,
+                "endRow": 500,
+                "endColumn": 50
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("TOPAPI获取数据请求失败: {}", e))?;
+
+    let range_status = range_resp.status();
+    let range_text = range_resp.text().await.unwrap_or_default();
+    println!(
+        "[DingTalk Sheet TOPAPI] range status: {} body: {}",
+        range_status, range_text
+    );
+
+    if !range_status.is_success() {
+        return Err(format!("TOPAPI获取数据失败: {}", range_text));
+    }
+
+    let range_json: serde_json::Value = serde_json::from_str(&range_text)
+        .map_err(|e| format!("解析数据响应失败: {}", e))?;
+
+    let errcode = range_json.get("errcode").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if errcode != 0 {
+        let errmsg = range_json
+            .get("errmsg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("TOPAPI获取数据错误 [{}]: {}", errcode, errmsg));
+    }
+
+    parse_sheet_cells(&range_json)
+}
+
+fn parse_sheet_cells(json: &serde_json::Value) -> Result<Vec<Vec<String>>, String> {
+    let rows_data = json
+        .get("cells")
+        .and_then(|v| v.as_array())
+        .or_else(|| json.get("data").and_then(|v| v.get("cells")).and_then(|v| v.as_array()))
+        .ok_or("返回数据中没有cells字段")?;
+
+    let mut result: Vec<Vec<String>> = vec![];
+    let mut current_row: Vec<String> = vec![];
+    let mut current_row_idx = 0u32;
+
+    for cell in rows_data {
+        let row = cell.get("row").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let col = cell.get("column").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let value = cell
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if row != current_row_idx {
+            if !current_row.is_empty() {
+                result.push(current_row.clone());
+            }
+            current_row = vec![];
+            current_row_idx = row;
+        }
+
+        while current_row.len() < col {
+            current_row.push("".to_string());
+        }
+        if current_row.len() == col {
+            current_row.push(value);
+        } else {
+            current_row[col] = value;
+        }
+    }
+
+    if !current_row.is_empty() {
+        result.push(current_row);
+    }
+
+    result.retain(|row| row.iter().any(|cell| !cell.is_empty()));
+
+    if result.is_empty() {
+        return Err("表格数据为空".to_string());
+    }
+
+    Ok(result)
+}
+
+async fn fetch_dingtalk_bitable_data(
+    token: &str,
+    url: &str,
+    operator_id: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    let base_id = extract_notable_base_id(url)
+        .ok_or("无法从链接中提取多维表ID，请确保是钉钉多维表分享链接")?;
+
+    println!(
+        "[DingTalk Bitable] base_id: {}, operator_id: {}",
+        base_id, operator_id
+    );
+    let client = reqwest::Client::new();
+
+    // 1. 获取多维表内的所有子表（Sheet）
+    let sheets_url = format!(
+        "https://api.dingtalk.com/v1.0/notable/bases/{}/sheets?operatorId={}",
+        base_id, operator_id
+    );
+    let sheets_resp = client
+        .get(&sheets_url)
+        .header("x-acs-dingtalk-access-token", token)
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("获取子表列表请求失败: {}", e))?;
+
+    let sheets_status = sheets_resp.status();
+    let sheets_text = sheets_resp.text().await.unwrap_or_default();
+    println!(
+        "[DingTalk Bitable] sheets status: {} body: {}",
+        sheets_status, sheets_text
+    );
+
+    if !sheets_status.is_success() {
+        return Err(format!("获取子表列表失败: {}", sheets_text));
+    }
+
+    let sheets_json: serde_json::Value = serde_json::from_str(&sheets_text)
+        .map_err(|e| format!("解析子表列表失败: {}", e))?;
+
+    let sheets = sheets_json
+        .get("value")
+        .and_then(|v| v.as_array())
+        .ok_or("返回数据中没有value字段（请检查是否已开启 AI表格应用读权限）")?;
+
+    if sheets.is_empty() {
+        return Err("多维表中没有找到子表".to_string());
+    }
+
+    let first_sheet = &sheets[0];
+    let sheet_id = first_sheet
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("子表没有id字段")?;
+    let sheet_name = first_sheet
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Sheet1");
+    println!(
+        "[DingTalk Bitable] 使用子表: {} ({})",
+        sheet_name, sheet_id
+    );
+
+    // 2. 读取记录
+    let records_url = format!(
+        "https://api.dingtalk.com/v1.0/notable/bases/{}/sheets/{}/records/list?operatorId={}",
+        base_id, sheet_id, operator_id
+    );
+    let records_resp = client
+        .post(&records_url)
+        .header("x-acs-dingtalk-access-token", token)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "maxResults": 100 }))
+        .send()
+        .await
+        .map_err(|e| format!("获取记录请求失败: {}", e))?;
+
+    let records_status = records_resp.status();
+    let records_text = records_resp.text().await.unwrap_or_default();
+    println!(
+        "[DingTalk Bitable] records status: {} body: {}",
+        records_status, records_text
+    );
+
+    if !records_status.is_success() {
+        return Err(format!("获取记录失败: {}", records_text));
+    }
+
+    let records_json: serde_json::Value = serde_json::from_str(&records_text)
+        .map_err(|e| format!("解析记录失败: {}", e))?;
+
+    // 兼容两种返回格式: { "records": [...] } 或 { "value": { "records": [...] } }
+    let records = records_json
+        .get("records")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            records_json
+                .get("value")
+                .and_then(|v| v.get("records"))
+                .and_then(|v| v.as_array())
+        })
+        .ok_or("返回数据中没有records字段")?;
+
+    if records.is_empty() {
+        return Err("多维表中没有记录".to_string());
+    }
+
+    // 遍历所有记录收集字段名（钉钉多维表采用稀疏存储，不同记录的字段可能不同）
+    let mut headers: Vec<String> = vec![];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rec in records {
+        if let Some(fields) = rec.get("fields").and_then(|v| v.as_object()) {
+            for key in fields.keys() {
+                if seen.insert(key.clone()) {
+                    headers.push(key.clone());
+                }
+            }
+        }
+    }
+
+    if headers.is_empty() {
+        return Err("多维表中没有字段".to_string());
+    }
+
+    let mut result: Vec<Vec<String>> = vec![];
+    result.push(headers.clone());
+
+    for rec in records {
+        if let Some(fields) = rec.get("fields").and_then(|v| v.as_object()) {
+            let mut row: Vec<String> = vec![];
+            for key in &headers {
+                let raw_value = fields.get(key);
+                let value = format_field_value(raw_value);
+                row.push(value);
+            }
+            result.push(row);
+        }
+    }
+
+    if result.len() <= 1 {
+        return Err("多维表记录为空".to_string());
+    }
+
+    Ok(result)
+}
+
+/// 格式化钉钉多维表字段值，自动处理时间戳、多选、对象等类型
+fn format_field_value(raw: Option<&serde_json::Value>) -> String {
+    let v = match raw {
+        Some(v) => v,
+        None => return String::new(),
+    };
+
+    if let Some(s) = v.as_str() {
+        // 检测是否为毫秒时间戳（13位纯数字）
+        if s.len() == 13 && s.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(ts) = s.parse::<i64>() {
+                let dt = chrono::DateTime::from_timestamp_millis(ts);
+                return dt
+                    .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| s.to_string());
+            }
+        }
+        s.to_string()
+    } else if let Some(arr) = v.as_array() {
+        let vals: Vec<String> = arr
+            .iter()
+            .filter_map(|i| {
+                if let Some(s) = i.as_str() {
+                    Some(s.to_string())
+                } else if let Some(obj) = i.as_object() {
+                    obj.get("text")
+                        .or_else(|| obj.get("name"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        vals.join(", ")
+    } else if let Some(obj) = v.as_object() {
+        obj.get("text")
+            .or_else(|| obj.get("name"))
+            .or_else(|| obj.get("address"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    } else if let Some(num) = v.as_i64() {
+        // 检测数字类型的时间戳（毫秒）
+        if num > 1_000_000_000_000 && num < 9_999_999_999_999 {
+            chrono::DateTime::from_timestamp_millis(num)
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| num.to_string())
+        } else {
+            num.to_string()
+        }
+    } else if let Some(num) = v.as_f64() {
+        num.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn insert_data_into_table(conn: &rusqlite::Connection, table_name: &str, data: Vec<Vec<String>>, mode: &str) -> Result<usize, String> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let headers = &data[0];
+    let columns: Vec<String> = headers.iter().map(|h| format!("\"{}\"", h.replace('"', ""))).collect();
+    let placeholders: Vec<String> = (1..=headers.len()).map(|i| format!("?{}", i)).collect();
+
+    // 覆盖模式：清空表
+    if mode == "overwrite" {
+        let _ = conn.execute(&format!("DELETE FROM \"{}\"", table_name), []);
+    }
+
+    let sql = format!(
+        "INSERT INTO \"{}\" ({}) VALUES ({})",
+        table_name,
+        columns.join(", "),
+        placeholders.join(", ")
+    );
+
+    let mut count = 0usize;
+    for row in data.iter().skip(1) {
+        let params: Vec<&dyn rusqlite::ToSql> = row.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        match conn.execute(&sql, rusqlite::params_from_iter(params)) {
+            Ok(_) => count += 1,
+            Err(e) => eprintln!("[DingTalk Sync] 插入行失败: {}", e),
+        }
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+async fn sync_dingtalk_sheet(
+    dashboard_id: String,
+    operator_id: Option<String>,
+    sync_mode: Option<String>,
+) -> Result<i32, String> {
+    let dashboard = get_dashboard(dashboard_id.clone()).await?;
+    let doc_url = dashboard.dingtalk_doc_url.ok_or("看板没有关联钉钉文档")?;
+    let doc_type = parse_dingtalk_url(&doc_url).map(|(t, _)| t).unwrap_or("sheet");
+
+    // 自动读取看板保存的 operator_id，外部传入的优先
+    let op_id = if let Some(ref oid) = operator_id {
+        oid.clone()
+    } else if let Some(ref oid) = dashboard.dingtalk_operator_id {
+        oid.clone()
+    } else {
+        String::new()
+    };
+
+    let token = get_dingtalk_token_from_config().await?;
+    let data = if doc_type == "bitable" {
+        if op_id.is_empty() {
+            return Err("同步钉钉多维表需要提供 OPERATOR_ID".to_string());
+        }
+        fetch_dingtalk_bitable_data(&token, &doc_url, &op_id).await?
+    } else {
+        fetch_dingtalk_sheet_data(&token, &doc_url).await?
+    };
+
+    let table_name = dashboard.source_table.ok_or("看板没有关联数据表")?;
+    let conn = init_db()?;
+    let mode = sync_mode.unwrap_or_else(|| "overwrite".to_string());
+    let count = insert_data_into_table(&conn, &table_name, data, &mode)?;
+
+    // 更新最后同步时间
+    conn.execute(
+        "UPDATE dashboards SET dingtalk_last_sync = datetime('now','localtime') WHERE id = ?1",
+        [&dashboard_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(count as i32)
+}
+
+#[tauri::command]
+async fn import_dingtalk_sheet(
+    url: String,
+    mode: String,
+    prompt: Option<String>,
+    operator_id: Option<String>,
+) -> Result<String, String> {
+    let doc_type = parse_dingtalk_url(&url).map(|(t, _)| t).unwrap_or("sheet");
+    let token = get_dingtalk_token_from_config().await?;
+    let data = if doc_type == "bitable" {
+        let op_id = operator_id.clone().ok_or("读取钉钉多维表需要提供 OPERATOR_ID")?;
+        fetch_dingtalk_bitable_data(&token, &url, &op_id).await?
+    } else {
+        fetch_dingtalk_sheet_data(&token, &url).await?
+    };
+
+    if data.is_empty() {
+        return Err("从钉钉获取的数据为空".to_string());
+    }
+
+    // 创建本地表
+    let table_name = format!("dingtalk_{}", Uuid::new_v4().to_string().replace("-", "").to_lowercase());
+    let conn = init_db()?;
+    let headers = &data[0];
+    let col_defs: Vec<String> = headers.iter().map(|h| format!("\"{}\" TEXT", h.replace('"', ""))).collect();
+    let create_sql = format!("CREATE TABLE IF NOT EXISTS \"{}\" ({})", table_name, col_defs.join(", "));
+    conn.execute(&create_sql, []).map_err(|e| e.to_string())?;
+
+    let row_count = data.len().saturating_sub(1);
+    println!("[DingTalk Import] 数据表 {} 创建成功，共 {} 行，模式: {}", table_name, row_count, mode);
+
+    // 插入数据
+    insert_data_into_table(&conn, &table_name, data, "overwrite")?;
+
+    // 创建看板：取前10行数据发给AI生成简易看板HTML（减少token消耗，加快速度）
+    let data_md = query_result_to_markdown(
+        &run_sql_query(&format!("SELECT * FROM \"{}\" LIMIT 10", table_name)
+        )?
+    );
+
+    let (ai_prompt, system_override) = if mode == "auto" {
+        let auto_prompt = r#"请根据以下表格数据，生成一个极简的HTML数据看板页面，只包含1个数据图表即可。
+要求：
+1. 使用单一HTML文件，ECharts通过CDN引入（https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js）
+2. 只需要1个图表，选择最适合数据特点的类型（柱状图、折线图或饼图），不需要KPI卡片、不需要复杂布局
+3. 主题色使用蓝色系（#3b82f6）
+4. 页面顶部显示看板标题，底部显示数据更新时间
+5. 不要包含任何"数据清洗"、"梳理"、"上传"相关的UI文字或按钮
+6. 直接输出完整可运行的HTML代码，不要加markdown代码块标记，不要解释"#;
+        let html_system = r#"你是一位前端数据可视化专家。请根据提供的数据生成极简HTML看板页面，只输出1个图表。必须直接输出HTML代码，不要输出markdown，不要加解释。"#;
+        (auto_prompt.to_string(), Some(html_system))
+    } else {
+        let prompt_text = prompt.unwrap_or_default();
+        (prompt_text, None)
+    };
+
+    println!("[DingTalk Import] 开始调用AI生成看板，prompt长度: {}", ai_prompt.len());
+    let ai_start = std::time::Instant::now();
+
+    let ai_result = analyze_with_ai(
+        &ai_prompt,
+        &data_md,
+        &table_name,
+        system_override,
+    ).await?;
+
+    println!("[DingTalk Import] AI生成完成，耗时 {:?}，结果长度: {}", ai_start.elapsed(), ai_result.len());
+
+    let dashboard_id = create_dashboard(
+        "钉钉数据看板".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(table_name.clone()),
+        None,
+        None,
+        Some(ai_result),
+        Some(doc_type.to_string()),
+        Some(url.clone()),
+        None,
+    ).await?;
+
+    // 保存 operator_id 到 dashboards 表
+    if let Some(ref op_id) = operator_id {
+        let conn = init_db()?;
+        conn.execute(
+            "UPDATE dashboards SET dingtalk_operator_id = ?1 WHERE id = ?2",
+            rusqlite::params![op_id, dashboard_id],
+        ).map_err(|e| e.to_string())?;
+    }
+
+    Ok(dashboard_id)
+}
+
+#[tauri::command]
+async fn get_unionid_by_mobile(mobile: String) -> Result<String, String> {
+    let token = get_dingtalk_token_from_config().await?;
+    let client = reqwest::Client::new();
+
+    // 1. 手机号 -> UserID
+    let userid_url = format!(
+        "https://oapi.dingtalk.com/topapi/v2/user/getbymobile?access_token={}",
+        token
+    );
+    let userid_resp = client
+        .post(&userid_url)
+        .json(&serde_json::json!({ "mobile": mobile }))
+        .send()
+        .await
+        .map_err(|e| format!("查询UserID请求失败: {}", e))?;
+
+    let userid_text = userid_resp.text().await.unwrap_or_default();
+    let userid_json: serde_json::Value = serde_json::from_str(&userid_text)
+        .map_err(|e| format!("解析UserID响应失败: {}", e))?;
+
+    let errcode = userid_json
+        .get("errcode")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    if errcode != 0 {
+        let errmsg = userid_json
+            .get("errmsg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("手机号查询UserID失败 [{}]: {}", errcode, errmsg));
+    }
+
+    let userid = userid_json
+        .get("result")
+        .and_then(|v| v.get("userid"))
+        .and_then(|v| v.as_str())
+        .ok_or("响应中没有userid字段")?;
+
+    // 2. UserID -> UnionID
+    let unionid_url = format!(
+        "https://oapi.dingtalk.com/topapi/v2/user/get?access_token={}",
+        token
+    );
+    let unionid_resp = client
+        .post(&unionid_url)
+        .json(&serde_json::json!({ "userid": userid }))
+        .send()
+        .await
+        .map_err(|e| format!("查询UnionID请求失败: {}", e))?;
+
+    let unionid_text = unionid_resp.text().await.unwrap_or_default();
+    let unionid_json: serde_json::Value = serde_json::from_str(&unionid_text)
+        .map_err(|e| format!("解析UnionID响应失败: {}", e))?;
+
+    let errcode = unionid_json
+        .get("errcode")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    if errcode != 0 {
+        let errmsg = unionid_json
+            .get("errmsg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("UserID查询UnionID失败 [{}]: {}", errcode, errmsg));
+    }
+
+    let unionid = unionid_json
+        .get("result")
+        .and_then(|v| v.get("unionid"))
+        .and_then(|v| v.as_str())
+        .ok_or("响应中没有unionid字段")?;
+
+    Ok(unionid.to_string())
 }
 
 #[tauri::command]
@@ -4543,6 +6268,9 @@ async fn create_dashboard_from_template_inner(
         None,
         None,
         Some(html_content.clone()),
+        None,
+        None,
+        None,
     )
     .await?;
 
@@ -4856,6 +6584,9 @@ async fn create_dashboard_from_ai_html_inner(
         None,
         None,
         Some(html_content.clone()),
+        None,
+        None,
+        None,
     )
     .await?;
 
@@ -5148,6 +6879,18 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // 启动时加载配置到内存缓存
+            tauri::async_runtime::spawn(async move {
+                if let Ok(cfg) = load_config(app_handle.clone()).await {
+                    if let Ok(mut cache) = CONFIG_CACHE.lock() {
+                        *cache = cfg;
+                        println!("[startup] 配置已加载到内存缓存");
+                    }
+                }
+            });
+
+            let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Ok(Some(status)) = load_share_status(app_handle.clone()).await {
                     println!("[startup] 发现之前分享的看板，正在恢复: {}", status.board_id);
@@ -5155,6 +6898,16 @@ pub fn run() {
                         eprintln!("[startup] 恢复分享服务器失败: {}", e);
                         let _ = clear_share_status(app_handle).await;
                     }
+                }
+            });
+
+            // 启动定时任务调度器
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    check_and_run_schedules(app_handle.clone()).await;
                 }
             });
             Ok(())
@@ -5221,6 +6974,15 @@ pub fn run() {
             pack_dashboard,
             import_dashboard_pack,
             read_file_base64,
+            create_schedule,
+            update_schedule,
+            delete_schedule,
+            get_schedules,
+            get_schedule_logs,
+            test_schedule_run,
+            sync_dingtalk_sheet,
+            import_dingtalk_sheet,
+            get_unionid_by_mobile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

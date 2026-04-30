@@ -50,6 +50,7 @@ import {
 import DashboardCard from "@/components/DashboardCard";
 import SqlRepairTracker from "@/components/SqlRepairTracker";
 import CreateDashboardModal from "@/components/CreateDashboardModal";
+import ScheduleModal from "@/components/ScheduleModal";
 import PendingDashboardCard from "@/components/PendingDashboardCard";
 import RetryPendingModal from "@/components/RetryPendingModal";
 import AiHtmlBuildOverlay from "@/components/AiHtmlBuildOverlay";
@@ -128,6 +129,8 @@ export default function DashboardPage() {
   const [editNameValue, setEditNameValue] = useState("");
   const [repairActive, setRepairActive] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleDashboard, setScheduleDashboard] = useState<Dashboard | null>(null);
   const [deletingDashboard, setDeletingDashboard] = useState<Dashboard | null>(null);
   const [refreshingTableData, setRefreshingTableData] = useState(false);
   const [deleteMode, setDeleteMode] = useState<"dashboard" | "with_table">("dashboard");
@@ -843,6 +846,10 @@ export default function DashboardPage() {
                 onModify={handleModifyDashboard}
                 onPack={handlePackDashboard}
                 onCopy={handleCopyDashboard}
+                onSchedule={(d) => {
+                  setScheduleDashboard(d);
+                  setScheduleOpen(true);
+                }}
                 onDelete={(d) => {
                   setDeletingDashboard(d);
                   setDeleteMode("dashboard");
@@ -1268,6 +1275,12 @@ export default function DashboardPage() {
           setBoardsSelectedId(id);
           refreshDashboards();
         }}
+      />
+
+      <ScheduleModal
+        open={scheduleOpen}
+        onOpenChange={setScheduleOpen}
+        dashboard={scheduleDashboard}
       />
 
       <RetryPendingModal

@@ -13,6 +13,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Popover,
   PopoverContent,
@@ -115,15 +116,22 @@ export default function CreateDashboardModal({
   const [result, setResult] = useState<CreateDashboardResult | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createdTablesOnError, setCreatedTablesOnError] = useState<string[]>([]);
+  const [createMode, setCreateMode] = useState<'template' | 'dingtalk'>('template');
+  const [dingtalkUrl, setDingtalkUrl] = useState("");
+  const [dingtalkMode, setDingtalkMode] = useState<'auto' | 'prompt'>('auto');
+  const [dingtalkPrompt, setDingtalkPrompt] = useState("");
+  const [operatorId, setOperatorId] = useState("");
+  const [mobile, setMobile] = useState("");
+  const [fetchingOperatorId, setFetchingOperatorId] = useState(false);
 
   // 加载已有表
   useEffect(() => {
-    if (open && step === 1) {
+    if (open && step === 1 && createMode === 'template') {
       invoke<ChatTableInfo[]>("list_db_tables_for_chat")
         .then((tables) => setExistingTables(tables))
         .catch(() => setExistingTables([]));
     }
-  }, [open, step]);
+  }, [open, step, createMode]);
 
   // 重置状态
   const resetState = useCallback(() => {
@@ -138,6 +146,12 @@ export default function CreateDashboardModal({
     setResult(null);
     setCreateError(null);
     setCreatedTablesOnError([]);
+    setCreateMode('template');
+    setDingtalkUrl("");
+    setDingtalkMode('auto');
+    setDingtalkPrompt("");
+    setOperatorId("");
+    setMobile("");
   }, []);
 
   useEffect(() => {
@@ -234,8 +248,9 @@ export default function CreateDashboardModal({
   };
 
   const canProceed =
-    htmlContent.length > 0 &&
-    (newFiles.length > 0 || selectedTables.size > 0);
+    createMode === 'template'
+      ? htmlContent.length > 0 && (newFiles.length > 0 || selectedTables.size > 0)
+      : dingtalkUrl.trim().length > 0 && mobile.trim().length > 0;
 
   const handleCreate = async () => {
     if (!canProceed) return;
@@ -244,30 +259,60 @@ export default function CreateDashboardModal({
     setCreating(true);
     setCreateError(null);
     try {
-      const spec: NewFileSpec[] = newFiles.map((f) => ({
-        file_path: f.path,
-        target_table_name: f.targetTable || sanitizeTableName(f.fileName),
-      }));
-      const res = await invoke<CreateDashboardResult>(
-        "create_dashboard_from_template",
-        {
-          htmlContent,
-          newFiles: spec,
-          existingTables: Array.from(selectedTables),
-          dashboardName: dashboardName.trim() || undefined,
+      if (createMode === 'dingtalk') {
+        let finalOperatorId = operatorId.trim();
+        if (!finalOperatorId && mobile.trim()) {
+          setFetchingOperatorId(true);
+          try {
+            finalOperatorId = await invoke<string>(
+              "get_unionid_by_mobile",
+              { mobile: mobile.trim() }
+            );
+            setOperatorId(finalOperatorId);
+          } catch (e) {
+            throw new Error("获取 UnionID 失败: " + String(e));
+          } finally {
+            setFetchingOperatorId(false);
+          }
         }
-      );
-      setResult(res);
-      setStep(3);
-      toast.success(`看板「${res.dashboard_name}」创建成功`);
-      if (res.warnings.length > 0) {
-        res.warnings.forEach((w) => toast.warning(w));
+        const dashboardId = await invoke<string>("import_dingtalk_sheet", {
+          url: dingtalkUrl.trim(),
+          mode: dingtalkMode,
+          prompt: dingtalkPrompt.trim() || undefined,
+          operatorId: finalOperatorId,
+        });
+        setResult({
+          dashboard_id: dashboardId,
+          dashboard_name: "钉钉数据看板",
+          created_tables: [],
+          warnings: [],
+        });
+        setStep(3);
+        toast.success("钉钉数据看板创建成功");
+      } else {
+        const spec: NewFileSpec[] = newFiles.map((f) => ({
+          file_path: f.path,
+          target_table_name: f.targetTable || sanitizeTableName(f.fileName),
+        }));
+        const res = await invoke<CreateDashboardResult>(
+          "create_dashboard_from_template",
+          {
+            htmlContent,
+            newFiles: spec,
+            existingTables: Array.from(selectedTables),
+            dashboardName: dashboardName.trim() || undefined,
+          }
+        );
+        setResult(res);
+        setStep(3);
+        toast.success(`看板「${res.dashboard_name}」创建成功`);
+        if (res.warnings.length > 0) {
+          res.warnings.forEach((w) => toast.warning(w));
+        }
       }
     } catch (e) {
       const msg = String(e);
       setCreateError(msg);
-      // 尝试从错误信息中提取已建表名（后端会在错误中包含已建表信息）
-      // 这里简化处理，实际回滚需要用户手动触发
       setStep(2);
     } finally {
       setCreating(false);
@@ -321,6 +366,110 @@ export default function CreateDashboardModal({
         <div className="flex-1 overflow-auto space-y-4">
           {step === 1 && (
             <>
+              {/* 创建方式切换 */}
+              <div className="flex gap-2 rounded-lg bg-slate-100 p-1">
+                <button
+                  type="button"
+                  onClick={() => setCreateMode('template')}
+                  className={`flex-1 rounded-md py-1.5 text-sm font-medium transition-colors ${
+                    createMode === 'template'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-700'
+                  }`}
+                >
+                  从模板创建
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreateMode('dingtalk')}
+                  className={`flex-1 rounded-md py-1.5 text-sm font-medium transition-colors ${
+                    createMode === 'dingtalk'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-700'
+                  }`}
+                >
+                  从钉钉表格创建
+                </button>
+              </div>
+
+              {createMode === 'dingtalk' ? (
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <Label>钉钉多维表ID (baseId)</Label>
+                    <input
+                      placeholder="例如: 93NwLYZXWyAYoKPGuYmKX24DWkyEqBQm"
+                      value={dingtalkUrl}
+                      onChange={(e) => setDingtalkUrl(e.target.value)}
+                      className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    />
+                    <p className="text-[11px] text-slate-400">
+                      在钉钉多维表详情页或分享弹窗中可复制此ID
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>有权限查看表格的手机号</Label>
+                    <div className="flex gap-2 items-center">
+                      <input
+                        placeholder="输入有权限查看表格的手机号"
+                        value={mobile}
+                        onChange={(e) => setMobile(e.target.value)}
+                        className="flex-1 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      />
+                      {fetchingOperatorId && (
+                        <Loader2 className="h-4 w-4 animate-spin text-slate-400" />
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>创建模式</Label>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setDingtalkMode('auto')}
+                        className={`flex-1 rounded-lg border p-3 text-left transition-colors ${
+                          dingtalkMode === 'auto'
+                            ? 'border-blue-500 bg-blue-50'
+                            : 'border-slate-200 hover:bg-slate-50'
+                        }`}
+                      >
+                        <div className="text-sm font-medium">AI 自动创建</div>
+                        <div className="text-xs text-slate-500 mt-1">
+                          AI 根据表格内容自动决定看板样式
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDingtalkMode('prompt')}
+                        className={`flex-1 rounded-lg border p-3 text-left transition-colors ${
+                          dingtalkMode === 'prompt'
+                            ? 'border-blue-500 bg-blue-50'
+                            : 'border-slate-200 hover:bg-slate-50'
+                        }`}
+                      >
+                        <div className="text-sm font-medium">写提示词创建</div>
+                        <div className="text-xs text-slate-500 mt-1">
+                          通过提示词指导 AI 创建看板
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+
+                  {dingtalkMode === 'prompt' && (
+                    <div className="space-y-2">
+                      <Label>创建提示词</Label>
+                      <Textarea
+                        placeholder="例如：帮我创建一个销售分析看板，包含各区域销售额对比柱状图和月度趋势折线图"
+                        value={dingtalkPrompt}
+                        onChange={(e) => setDingtalkPrompt(e.target.value)}
+                        rows={3}
+                      />
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <>
               {/* HTML 上传 */}
               <div className="space-y-2">
                 <Label>上传 HTML 设计稿（必须）</Label>
@@ -539,9 +688,24 @@ export default function CreateDashboardModal({
               </div>
             </>
           )}
+          </>
+          )}
 
           {step === 2 && (
             <div className="space-y-4">
+              <div className="text-center space-y-2 py-4">
+                <Loader2 className="h-8 w-8 animate-spin text-blue-500 mx-auto" />
+                <p className="text-sm font-medium text-slate-700">
+                  {createMode === 'dingtalk' && dingtalkMode === 'auto'
+                    ? 'AI 正在生成简易看板（单图表）...'
+                    : createMode === 'dingtalk' && dingtalkMode === 'prompt'
+                    ? 'AI 正在根据提示词生成看板...'
+                    : 'AI 正在生成...'}
+                </p>
+                <p className="text-xs text-slate-400">
+                  数据已获取，正在等待 AI 返回结果，请稍候
+                </p>
+              </div>
               <CreateDashboardTracker isActive={trackerActive} />
               {createError && (
                 <div className="border rounded-lg p-4 space-y-3">
