@@ -7,7 +7,7 @@ git status
 git add .
 
 ## 4. 打修改说明（提交到本地）
-git commit -m "修复钉钉二次同步问题"
+git commit -m "修复钉钉三次同步问题"
 
 # 带详细说明的提交
 git commit -m "功能标题" -m "详细描述修改内容"

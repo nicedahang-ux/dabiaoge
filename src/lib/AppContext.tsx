@@ -45,6 +45,9 @@ export interface Dashboard {
   dingtalk_doc_id?: string;
   dingtalk_last_sync?: string;
   dingtalk_operator_id?: string;
+  dingtalk_sheet_id?: string;
+  dingtalk_sheet_name?: string;
+  dingtalk_selected_fields?: string;
   created_at: string;
   updated_at: string;
 }

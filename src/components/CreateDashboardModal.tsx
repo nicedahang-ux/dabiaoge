@@ -124,6 +124,16 @@ export default function CreateDashboardModal({
   const [mobile, setMobile] = useState("");
   const [fetchingOperatorId, setFetchingOperatorId] = useState(false);
 
+  // 钉钉子表 / 字段选择
+  interface DingtalkFieldInfo { name: string; field_type: string }
+  interface DingtalkSheetInfo { id: string; name: string; fields: DingtalkFieldInfo[] }
+  const [dingtalkSheets, setDingtalkSheets] = useState<DingtalkSheetInfo[]>([]);
+  const [selectedSheetId, setSelectedSheetId] = useState<string>("");
+  // 每个子表独立维护一份"勾选字段"集合
+  const [selectedFieldsBySheet, setSelectedFieldsBySheet] = useState<Record<string, Set<string>>>({});
+  const [loadingSheets, setLoadingSheets] = useState(false);
+  const [sheetsLoaded, setSheetsLoaded] = useState(false);
+
   // 加载已有表
   useEffect(() => {
     if (open && step === 1 && createMode === 'template') {
@@ -152,6 +162,11 @@ export default function CreateDashboardModal({
     setDingtalkPrompt("");
     setOperatorId("");
     setMobile("");
+    setDingtalkSheets([]);
+    setSelectedSheetId("");
+    setSelectedFieldsBySheet({});
+    setLoadingSheets(false);
+    setSheetsLoaded(false);
   }, []);
 
   useEffect(() => {
@@ -250,7 +265,72 @@ export default function CreateDashboardModal({
   const canProceed =
     createMode === 'template'
       ? htmlContent.length > 0 && (newFiles.length > 0 || selectedTables.size > 0)
-      : dingtalkUrl.trim().length > 0 && mobile.trim().length > 0;
+      : dingtalkUrl.trim().length > 0 &&
+        mobile.trim().length > 0 &&
+        sheetsLoaded &&
+        selectedSheetId.length > 0 &&
+        (selectedFieldsBySheet[selectedSheetId]?.size ?? 0) > 0;
+
+  // 加载钉钉子表 + 字段
+  const handleLoadSheets = async () => {
+    if (!dingtalkUrl.trim() || !mobile.trim()) {
+      toast.error("请先填写多维表 ID 和手机号");
+      return;
+    }
+    setLoadingSheets(true);
+    setSheetsLoaded(false);
+    try {
+      // 先拿 unionId
+      let opId = operatorId.trim();
+      if (!opId) {
+        opId = await invoke<string>("get_unionid_by_mobile", { mobile: mobile.trim() });
+        setOperatorId(opId);
+      }
+      const sheets = await invoke<DingtalkSheetInfo[]>("list_dingtalk_sheets", {
+        baseIdOrUrl: dingtalkUrl.trim(),
+        operatorId: opId,
+      });
+      if (!sheets || sheets.length === 0) {
+        toast.error("该多维表下没有子表");
+        return;
+      }
+      setDingtalkSheets(sheets);
+      // 默认选第一个子表，并默认勾选所有字段
+      const firstSheet = sheets[0];
+      setSelectedSheetId(firstSheet.id);
+      const initSelected: Record<string, Set<string>> = {};
+      for (const s of sheets) {
+        initSelected[s.id] = new Set(s.fields.map((f) => f.name));
+      }
+      setSelectedFieldsBySheet(initSelected);
+      setSheetsLoaded(true);
+      toast.success(`已加载 ${sheets.length} 个子表`);
+    } catch (e) {
+      toast.error("加载子表失败: " + String(e));
+    } finally {
+      setLoadingSheets(false);
+    }
+  };
+
+  const toggleField = (sheetId: string, fieldName: string) => {
+    setSelectedFieldsBySheet((prev) => {
+      const next = { ...prev };
+      const set = new Set(next[sheetId] ?? []);
+      if (set.has(fieldName)) set.delete(fieldName);
+      else set.add(fieldName);
+      next[sheetId] = set;
+      return next;
+    });
+  };
+
+  const setAllFields = (sheetId: string, allOn: boolean) => {
+    const sheet = dingtalkSheets.find((s) => s.id === sheetId);
+    if (!sheet) return;
+    setSelectedFieldsBySheet((prev) => ({
+      ...prev,
+      [sheetId]: allOn ? new Set(sheet.fields.map((f) => f.name)) : new Set(),
+    }));
+  };
 
   const handleCreate = async () => {
     if (!canProceed) return;
@@ -275,11 +355,16 @@ export default function CreateDashboardModal({
             setFetchingOperatorId(false);
           }
         }
+        const sheetName = dingtalkSheets.find((s) => s.id === selectedSheetId)?.name;
+        const selectedFields = Array.from(selectedFieldsBySheet[selectedSheetId] ?? []);
         const dashboardId = await invoke<string>("import_dingtalk_sheet", {
           url: dingtalkUrl.trim(),
           mode: dingtalkMode,
           prompt: dingtalkPrompt.trim() || undefined,
           operatorId: finalOperatorId,
+          sheetId: selectedSheetId,
+          sheetName,
+          selectedFields,
         });
         setResult({
           dashboard_id: dashboardId,
@@ -420,6 +505,121 @@ export default function CreateDashboardModal({
                         <Loader2 className="h-4 w-4 animate-spin text-slate-400" />
                       )}
                     </div>
+                  </div>
+
+                  {/* 加载子表 + 选择子表 + 选择字段 */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>选择子表与字段</Label>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={handleLoadSheets}
+                        disabled={loadingSheets || !dingtalkUrl.trim() || !mobile.trim()}
+                      >
+                        {loadingSheets ? (
+                          <>
+                            <Loader2 className="h-3 w-3 animate-spin mr-1" /> 加载中...
+                          </>
+                        ) : sheetsLoaded ? (
+                          "重新加载"
+                        ) : (
+                          "加载子表"
+                        )}
+                      </Button>
+                    </div>
+
+                    {!sheetsLoaded ? (
+                      <p className="text-[11px] text-slate-400">
+                        填写多维表 ID 和手机号后，点击「加载子表」获取所有子表与字段列表
+                      </p>
+                    ) : (
+                      <div className="space-y-3 rounded-lg border bg-slate-50 p-3">
+                        {/* 子表 tab */}
+                        <div className="flex flex-wrap gap-1">
+                          {dingtalkSheets.map((s) => {
+                            const total = s.fields.length;
+                            const picked = selectedFieldsBySheet[s.id]?.size ?? 0;
+                            const active = selectedSheetId === s.id;
+                            return (
+                              <button
+                                key={s.id}
+                                type="button"
+                                onClick={() => setSelectedSheetId(s.id)}
+                                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                                  active
+                                    ? "bg-blue-500 text-white"
+                                    : "bg-white text-slate-700 hover:bg-slate-100 border border-slate-200"
+                                }`}
+                              >
+                                {s.name}
+                                <span className={`ml-1 text-[10px] ${active ? "text-blue-100" : "text-slate-400"}`}>
+                                  {picked}/{total}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {/* 当前子表的字段勾选 */}
+                        {selectedSheetId && (() => {
+                          const sheet = dingtalkSheets.find((s) => s.id === selectedSheetId);
+                          if (!sheet) return null;
+                          const set = selectedFieldsBySheet[selectedSheetId] ?? new Set<string>();
+                          const allOn = set.size === sheet.fields.length;
+                          return (
+                            <>
+                              <div className="flex items-center justify-between border-t pt-2">
+                                <span className="text-xs text-slate-500">
+                                  共 {sheet.fields.length} 个字段，已选 {set.size} 个（取消勾选的字段不会同步到本地）
+                                </span>
+                                <div className="flex gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => setAllFields(selectedSheetId, true)}
+                                    className="text-xs text-blue-600 hover:underline disabled:text-slate-300"
+                                    disabled={allOn}
+                                  >
+                                    全选
+                                  </button>
+                                  <span className="text-slate-300">|</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setAllFields(selectedSheetId, false)}
+                                    className="text-xs text-blue-600 hover:underline disabled:text-slate-300"
+                                    disabled={set.size === 0}
+                                  >
+                                    全不选
+                                  </button>
+                                </div>
+                              </div>
+                              <ScrollArea className="h-[200px] rounded-md border bg-white">
+                                <div className="grid grid-cols-2 gap-1 p-2">
+                                  {sheet.fields.map((f) => {
+                                    const checked = set.has(f.name);
+                                    return (
+                                      <label
+                                        key={f.name}
+                                        className="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-white cursor-pointer"
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={checked}
+                                          onChange={() => toggleField(selectedSheetId, f.name)}
+                                          className="h-3.5 w-3.5"
+                                        />
+                                        <span className="flex-1 truncate">{f.name}</span>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              </ScrollArea>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    )}
                   </div>
 
                   <div className="space-y-2">

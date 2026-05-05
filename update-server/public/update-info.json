@@ -1,7 +1,7 @@
 {
-  "version": "1.0.6",
-  "notes": "修复钉钉二次同步问题",
+  "version": "1.0.7",
+  "notes": "修复钉钉三次同步问题",
   "pub_date": "2026-05-01T12:00:00Z",
-  "url": "https://excel.lidani.cn:8990/download/AI表格转看板_1.0.6_x64-setup.nsis.zip",
-  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTUlZZQ1dLVXJZRXlVbUtaV0xjN2IybHdqa3hHNG11TVBoYktmZHNHb2ZDcDI4b3lLcERoL2E1ZDdXeDlPQ250T2NsRjNBQmNFMkw4ejAxb3Z4c3MzbVBWQ3I1d2hvS0FRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3NjgyOTY4CWZpbGU6QUnooajmoLzovaznnIvmnb9fMS4wLjZfeDY0LXNldHVwLm5zaXMuemlwCnAwcEI3S3NYUnNNY0Mra3VIdjJjSlZRbUhxNVljU3NhNmowWXBBVWJhVUtPWHlNRGZrOE5adlYwcEtiZ1VRNG51MU9rak5reGU1cXJpdExXb3ZwdEFnPT0K"
+  "url": "https://excel.lidani.cn:8990/download/AI表格转看板_1.0.7_x64-setup.nsis.zip",
+  "signature": ""
 }

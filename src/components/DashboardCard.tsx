@@ -1,4 +1,4 @@
-import { BarChart3, Copy, Wrench, ArrowRight, Trash2, Package, Files, Clock } from "lucide-react";
+import { BarChart3, Copy, Wrench, ArrowRight, Trash2, Package, Files, Clock, Settings2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -13,6 +13,7 @@ interface DashboardCardProps {
   onPack?: (dashboard: Dashboard) => void;
   onCopy?: (dashboard: Dashboard) => void;
   onSchedule?: (dashboard: Dashboard) => void;
+  onEditDingtalkFields?: (dashboard: Dashboard) => void;
 }
 
 export default function DashboardCard({
@@ -23,6 +24,7 @@ export default function DashboardCard({
   onPack,
   onCopy,
   onSchedule,
+  onEditDingtalkFields,
 }: DashboardCardProps) {
   const handleCopyId = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -116,6 +118,21 @@ export default function DashboardCard({
               <span className="hidden sm:inline">定时</span>
             </Button>
           )}
+          {onEditDingtalkFields &&
+            dashboard.source_type?.startsWith("dingtalk") && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 text-xs text-purple-600 hover:text-purple-700 hover:bg-purple-50 px-2"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEditDingtalkFields(dashboard);
+                }}
+              >
+                <Settings2 className="h-3 w-3" />
+                <span className="hidden sm:inline">同步字段</span>
+              </Button>
+            )}
           {onCopy && (
             <Button
               variant="ghost"

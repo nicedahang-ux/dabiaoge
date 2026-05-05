@@ -48,6 +48,8 @@ import {
 } from "@/components/ui/dialog";
 import TableUploadModal from "./TableUploadModal";
 import PythonCodeModal from "./PythonCodeModal";
+import CustomColumnsModal from "./CustomColumnsModal";
+import { Calculator } from "lucide-react";
 
 interface ColumnInfo {
   cid: number;
@@ -71,6 +73,16 @@ interface DashboardInfo {
   name: string;
   source_table?: string;
   sql_template?: string;
+}
+
+interface CustomColumn {
+  id: string;
+  table_name: string;
+  column_name: string;
+  sql_expression: string;
+  description?: string;
+  created_at: string;
+  updated_at: string;
 }
 
 const SYSTEM_TABLES: Record<string, { label: string; description: string }> = {
@@ -118,6 +130,8 @@ export default function DatabaseView() {
   // Modal states
   const [uploadOpen, setUploadOpen] = useState(false);
   const [codeOpen, setCodeOpen] = useState(false);
+  const [customColumnsOpen, setCustomColumnsOpen] = useState(false);
+  const [customColumns, setCustomColumns] = useState<CustomColumn[]>([]);
 
   // 表结构折叠 + 数据预览分页
   const PAGE_SIZE = 30;
@@ -209,16 +223,18 @@ export default function DatabaseView() {
     if (!selectedTable) return;
     setLoading(true);
     try {
-      const [schemaRes, dataRes] = await Promise.all([
+      const [schemaRes, dataRes, customCols] = await Promise.all([
         invoke<ColumnInfo[]>("get_table_schema", { tableName: selectedTable }),
         invoke<QueryResult>("query_table_data", {
           tableName: selectedTable,
           limit: PAGE_SIZE,
           offset: (page - 1) * PAGE_SIZE,
         }),
+        invoke<CustomColumn[]>("list_custom_columns", { tableName: selectedTable }).catch(() => [] as CustomColumn[]),
       ]);
       setSchema(schemaRes);
       setData(dataRes);
+      setCustomColumns(customCols);
       setSelectedRows(new Set());
       loadRemarks(selectedTable);
     } catch (e) {
@@ -562,6 +578,14 @@ export default function DatabaseView() {
                   <Code className="mr-1 h-3 w-3" /> Python代码
                 </Button>
               )}
+              <Button variant="outline" size="sm" onClick={() => setCustomColumnsOpen(true)}>
+                <Calculator className="mr-1 h-3 w-3" /> 公式列
+                {customColumns.length > 0 && (
+                  <span className="ml-1 text-[10px] bg-blue-100 text-blue-700 px-1 rounded">
+                    {customColumns.length}
+                  </span>
+                )}
+              </Button>
               {selectedRows.size > 0 && !selectedTable.startsWith("_board_") && (
                 <>
                   <Button variant="outline" size="sm" onClick={() => setBatchOpen(true)}>
@@ -670,9 +694,16 @@ export default function DatabaseView() {
                           )}
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="text-[0.625rem]">
-                            {col.type || "TEXT"}
-                          </Badge>
+                          <div className="flex items-center gap-1">
+                            <Badge variant="outline" className="text-[0.625rem]">
+                              {col.type || "TEXT"}
+                            </Badge>
+                            {customColumns.find((c) => c.column_name === col.name) && (
+                              <Badge className="text-[0.625rem] bg-purple-100 text-purple-700 hover:bg-purple-100">
+                                公式
+                              </Badge>
+                            )}
+                          </div>
                         </TableCell>
                         <TableCell>
                           {col.notnull ? (
@@ -1049,6 +1080,18 @@ export default function DatabaseView() {
           schema={schema}
           open={codeOpen}
           onOpenChange={setCodeOpen}
+        />
+      )}
+
+      {/* 公式列弹窗 */}
+      {selectedTable && (
+        <CustomColumnsModal
+          open={customColumnsOpen}
+          onOpenChange={setCustomColumnsOpen}
+          tableName={selectedTable}
+          onApplied={() => {
+            loadTableDetail();
+          }}
         />
       )}
     </div>

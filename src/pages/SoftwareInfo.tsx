@@ -57,6 +57,13 @@ const FEATURES = [
 
 const CHANGELOG = [
   {
+    version: "1.0.7",
+    date: "2026-05-01",
+    items: [
+      "修复钉钉三次同步问题",
+    ],
+  },
+  {
     version: "1.0.6",
     date: "2026-05-01",
     items: [

@@ -20,6 +20,8 @@ import {
   Download,
   Upload,
   Zap,
+  Calculator,
+  Settings2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -51,6 +53,8 @@ import DashboardCard from "@/components/DashboardCard";
 import SqlRepairTracker from "@/components/SqlRepairTracker";
 import CreateDashboardModal from "@/components/CreateDashboardModal";
 import ScheduleModal from "@/components/ScheduleModal";
+import EditDingtalkSyncModal from "@/components/EditDingtalkSyncModal";
+import CustomColumnsModal from "@/components/CustomColumnsModal";
 import PendingDashboardCard from "@/components/PendingDashboardCard";
 import RetryPendingModal from "@/components/RetryPendingModal";
 import AiHtmlBuildOverlay from "@/components/AiHtmlBuildOverlay";
@@ -131,6 +135,10 @@ export default function DashboardPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduleDashboard, setScheduleDashboard] = useState<Dashboard | null>(null);
+  const [editSyncOpen, setEditSyncOpen] = useState(false);
+  const [editSyncDashboard, setEditSyncDashboard] = useState<Dashboard | null>(null);
+  const [customColumnsOpen, setCustomColumnsOpen] = useState(false);
+  const [customColumnsTable, setCustomColumnsTable] = useState<string>("");
   const [deletingDashboard, setDeletingDashboard] = useState<Dashboard | null>(null);
   const [refreshingTableData, setRefreshingTableData] = useState(false);
   const [deleteMode, setDeleteMode] = useState<"dashboard" | "with_table">("dashboard");
@@ -850,6 +858,10 @@ export default function DashboardPage() {
                   setScheduleDashboard(d);
                   setScheduleOpen(true);
                 }}
+                onEditDingtalkFields={(d) => {
+                  setEditSyncDashboard(d);
+                  setEditSyncOpen(true);
+                }}
                 onDelete={(d) => {
                   setDeletingDashboard(d);
                   setDeleteMode("dashboard");
@@ -948,6 +960,33 @@ export default function DashboardPage() {
                   重建AI数据
                 </button
                 >
+                <button
+                  onClick={() => {
+                    if (selectedDashboard?.source_table) {
+                      setCustomColumnsTable(selectedDashboard.source_table);
+                      setCustomColumnsOpen(true);
+                    }
+                  }}
+                  disabled={!selectedDashboard.source_table}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md text-xs hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Calculator className="h-3.5 w-3.5" />
+                  公式列
+                </button
+                >
+                {selectedDashboard.source_type?.startsWith("dingtalk") && (
+                  <button
+                    onClick={() => {
+                      setEditSyncDashboard(selectedDashboard);
+                      setEditSyncOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md text-xs hover:bg-slate-50"
+                  >
+                    <Settings2 className="h-3.5 w-3.5" />
+                    同步字段
+                  </button
+                  >
+                )}
                 <button
                   onClick={() => handleModifyDashboard(selectedDashboard)}
                   className="inline-flex items-center gap-1 px-3 py-1.5 bg-blue-600 text-white rounded-md text-xs hover:bg-blue-700"
@@ -1281,6 +1320,34 @@ export default function DashboardPage() {
         open={scheduleOpen}
         onOpenChange={setScheduleOpen}
         dashboard={scheduleDashboard}
+      />
+
+      <EditDingtalkSyncModal
+        open={editSyncOpen}
+        onOpenChange={setEditSyncOpen}
+        dashboard={editSyncDashboard}
+        onSaved={async () => {
+          await refreshDashboards();
+          if (editSyncDashboard?.id) {
+            toast.info("正在按新配置重新同步数据...");
+            try {
+              const count = await invoke<number>("sync_dingtalk_sheet", {
+                dashboardId: editSyncDashboard.id,
+              });
+              toast.success(`同步完成，共写入 ${count} 条记录`);
+              await refreshDashboards();
+            } catch (e: any) {
+              toast.error("同步失败: " + (e?.toString?.() || String(e)));
+            }
+          }
+        }}
+      />
+
+      <CustomColumnsModal
+        open={customColumnsOpen}
+        onOpenChange={setCustomColumnsOpen}
+        tableName={customColumnsTable}
+        onApplied={() => refreshDashboards()}
       />
 
       <RetryPendingModal
