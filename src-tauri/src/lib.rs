@@ -1251,6 +1251,7 @@ fn init_db() -> Result<rusqlite::Connection, String> {
             schedule_type TEXT NOT NULL,
             schedule_config TEXT NOT NULL DEFAULT '{}',
             webhook_url TEXT NOT NULL DEFAULT '',
+            phone_number TEXT NOT NULL DEFAULT '',
             task_type TEXT NOT NULL DEFAULT 'analysis',
             sync_mode TEXT NOT NULL DEFAULT 'overwrite',
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -1286,7 +1287,7 @@ fn init_db() -> Result<rusqlite::Connection, String> {
         rows.filter_map(|r| r.ok())
             .collect::<std::collections::HashSet<String>>()
     };
-    for (col, typ) in [("task_type", "TEXT"), ("sync_mode", "TEXT")] {
+    for (col, typ) in [("task_type", "TEXT"), ("sync_mode", "TEXT"), ("phone_number", "TEXT NOT NULL DEFAULT ''")] {
         if !schedule_cols.contains(col) {
             let sql = format!("ALTER TABLE dashboard_schedules ADD COLUMN {} {}", col, typ);
             if let Err(e) = conn.execute(&sql, []) {
@@ -1779,6 +1780,7 @@ pub struct DashboardSchedule {
     pub schedule_type: String,
     pub schedule_config: String,
     pub webhook_url: String,
+    pub phone_number: String,
     pub task_type: String,
     pub sync_mode: String,
     pub enabled: bool,
@@ -1814,6 +1816,7 @@ async fn create_schedule(
     schedule_type: String,
     schedule_config: String,
     webhook_url: String,
+    phone_number: String,
     task_type: Option<String>,
     sync_mode: Option<String>,
 ) -> Result<String, String> {
@@ -1822,8 +1825,8 @@ async fn create_schedule(
     let task = task_type.unwrap_or_else(|| "analysis".to_string());
     let sync = sync_mode.unwrap_or_else(|| "overwrite".to_string());
     conn.execute(
-        "INSERT INTO dashboard_schedules (id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task_type, sync_mode, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
-        rusqlite::params![id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task, sync],
+        "INSERT INTO dashboard_schedules (id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, phone_number, task_type, sync_mode, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+        rusqlite::params![id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, phone_number, task, sync],
     )
     .map_err(|e| e.to_string())?;
     Ok(id)
@@ -1836,6 +1839,7 @@ async fn update_schedule(
     schedule_type: String,
     schedule_config: String,
     webhook_url: String,
+    phone_number: String,
     enabled: bool,
     task_type: Option<String>,
     sync_mode: Option<String>,
@@ -1845,8 +1849,8 @@ async fn update_schedule(
     let task = task_type.unwrap_or_else(|| "analysis".to_string());
     let sync = sync_mode.unwrap_or_else(|| "overwrite".to_string());
     conn.execute(
-        "UPDATE dashboard_schedules SET prompt = ?1, schedule_type = ?2, schedule_config = ?3, webhook_url = ?4, enabled = ?5, task_type = ?6, sync_mode = ?7, updated_at = CURRENT_TIMESTAMP WHERE id = ?8",
-        rusqlite::params![prompt, schedule_type, schedule_config, webhook_url, enabled_i, task, sync, id],
+        "UPDATE dashboard_schedules SET prompt = ?1, schedule_type = ?2, schedule_config = ?3, webhook_url = ?4, phone_number = ?5, enabled = ?6, task_type = ?7, sync_mode = ?8, updated_at = CURRENT_TIMESTAMP WHERE id = ?9",
+        rusqlite::params![prompt, schedule_type, schedule_config, webhook_url, phone_number, enabled_i, task, sync, id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1867,12 +1871,12 @@ async fn get_schedules(dashboard_id: Option<String>) -> Result<Vec<DashboardSche
     let conn = init_db()?;
     let (sql, params): (String, Vec<&dyn rusqlite::ToSql>) = if let Some(did) = &dashboard_id {
         (
-            "SELECT id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task_type, sync_mode, enabled, created_at, updated_at FROM dashboard_schedules WHERE dashboard_id = ?1 ORDER BY updated_at DESC".to_string(),
+            "SELECT id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, phone_number, task_type, sync_mode, enabled, created_at, updated_at FROM dashboard_schedules WHERE dashboard_id = ?1 ORDER BY updated_at DESC".to_string(),
             vec![did as &dyn rusqlite::ToSql],
         )
     } else {
         (
-            "SELECT id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, task_type, sync_mode, enabled, created_at, updated_at FROM dashboard_schedules ORDER BY updated_at DESC".to_string(),
+            "SELECT id, dashboard_id, prompt, schedule_type, schedule_config, webhook_url, phone_number, task_type, sync_mode, enabled, created_at, updated_at FROM dashboard_schedules ORDER BY updated_at DESC".to_string(),
             vec![],
         )
     };
@@ -1886,11 +1890,12 @@ async fn get_schedules(dashboard_id: Option<String>) -> Result<Vec<DashboardSche
                 schedule_type: row.get(3)?,
                 schedule_config: row.get(4)?,
                 webhook_url: row.get(5)?,
-                task_type: row.get(6)?,
-                sync_mode: row.get(7)?,
-                enabled: row.get::<_, i64>(8).map(|v| v == 1).unwrap_or(true),
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                phone_number: row.get(6)?,
+                task_type: row.get(7)?,
+                sync_mode: row.get(8)?,
+                enabled: row.get::<_, i64>(9).map(|v| v == 1).unwrap_or(true),
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1998,11 +2003,20 @@ use tokio::sync::Mutex as TokioMutex;
 static RUNNING_SCHEDULES: once_cell::sync::Lazy<Arc<TokioMutex<std::collections::HashSet<String>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(TokioMutex::new(std::collections::HashSet::new())));
 
+fn parse_comma_list(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c == '\n' || c == '\r' || c == ' ' || c == '\t' || c == '；' || c == ';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) {
     let schedule_id = schedule.id.clone();
     let dashboard_id = schedule.dashboard_id.clone();
     let prompt = schedule.prompt.clone();
-    let webhook_url = schedule.webhook_url.clone();
+    let webhook_urls = parse_comma_list(&schedule.webhook_url);
+    let phone_numbers = parse_comma_list(&schedule.phone_number);
     let task_type = schedule.task_type.clone();
     let sync_mode = schedule.sync_mode.clone();
 
@@ -2068,7 +2082,7 @@ async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) 
             }
         };
 
-        let conn = match init_db() {
+        let mut conn = match init_db() {
             Ok(c) => c,
             Err(e) => {
                 let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("数据库连接失败: {}", e))).await;
@@ -2076,7 +2090,7 @@ async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) 
             }
         };
 
-        let count = match insert_data_into_table(&conn, &table_name, data, &sync_mode) {
+        let count = match insert_data_into_table(&mut conn, &table_name, data, &sync_mode, None) {
             Ok(c) => c,
             Err(e) => {
                 let _ = log_schedule_run(&schedule_id, "failed", None, Some(&format!("写入数据失败: {}", e))).await;
@@ -2093,7 +2107,7 @@ async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) 
         let result_msg = format!("同步成功，共写入 {} 条记录 (模式: {})", count, sync_mode);
 
         // 如果配置了 webhook，发送同步完成通知
-        if !webhook_url.is_empty() {
+        for url in &webhook_urls {
             let notify_md = format!(
                 "## 数据同步完成\n\n- 看板：{}\n- 同步模式：{}\n- 写入记录数：{}\n- 同步时间：{}",
                 dashboard.name,
@@ -2101,8 +2115,21 @@ async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) 
                 count,
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
             );
-            if let Err(e) = send_dingtalk_webhook(&webhook_url, &notify_md, &[]).await {
+            if let Err(e) = send_dingtalk_webhook(url, &notify_md, &[]).await {
                 eprintln!("[Scheduler] 同步通知发送失败: {}", e);
+            }
+        }
+        // 如果配置了手机号，私聊发送同步完成通知
+        for phone in &phone_numbers {
+            let notify_md = format!(
+                "## 数据同步完成\n\n- 看板：{}\n- 同步模式：{}\n- 写入记录数：{}\n- 同步时间：{}",
+                dashboard.name,
+                sync_mode,
+                count,
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+            );
+            if let Err(e) = send_dingtalk_private_message(phone, &notify_md, &[]).await {
+                eprintln!("[Scheduler] 同步私聊通知发送失败: {}", e);
             }
         }
 
@@ -2147,16 +2174,27 @@ async fn run_schedule_task(_app: tauri::AppHandle, schedule: DashboardSchedule) 
         }
     };
 
-    // 5. 发送钉钉
-    if let Err(e) = send_dingtalk_webhook(&webhook_url, &content_with_images, &image_urls
-    )
-    .await
-    {
+    // 5. 发送钉钉（Webhook + 私聊）
+    let mut send_errors = vec![];
+
+    for url in &webhook_urls {
+        if let Err(e) = send_dingtalk_webhook(url, &content_with_images, &image_urls).await {
+            send_errors.push(format!("Webhook发送失败: {}", e));
+        }
+    }
+
+    for phone in &phone_numbers {
+        if let Err(e) = send_dingtalk_private_message(phone, &content_with_images, &image_urls).await {
+            send_errors.push(format!("私聊发送失败: {}", e));
+        }
+    }
+
+    if !send_errors.is_empty() {
         let _ = log_schedule_run(
             &schedule_id,
             "failed",
             Some(&analysis_result),
-            Some(&format!("发送钉钉失败: {}", e)),
+            Some(&send_errors.join("; ")),
         )
         .await;
         return;
@@ -2372,6 +2410,15 @@ fn load_config_db() -> Result<AppConfig, String> {
     Ok(cache.clone())
 }
 
+/// 从文本中自动提取图片链接（支持 jpg/jpeg/png/gif/webp/bmp/svg）
+fn extract_image_urls(text: &str) -> Vec<String> {
+    let re = regex::Regex::new(
+        r"https?://[^\s'\]\)<>]+\.(?:jpg|jpeg|png|gif|webp|bmp|svg)(?:\?[^\s'\]\)<>]*)?"
+    )
+    .unwrap();
+    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+}
+
 async fn send_dingtalk_webhook(
     webhook_url: &str,
     content: &str,
@@ -2382,12 +2429,22 @@ async fn send_dingtalk_webhook(
     }
     let client = reqwest::Client::new();
 
-    let markdown_text = if image_urls.is_empty() {
+    // 从内容中自动提取图片链接，合并去重
+    let extracted = extract_image_urls(content);
+    let mut seen = std::collections::HashSet::new();
+    let all_urls: Vec<String> = image_urls
+        .iter()
+        .cloned()
+        .chain(extracted.into_iter())
+        .filter(|u| seen.insert(u.clone()))
+        .collect();
+
+    let markdown_text = if all_urls.is_empty() {
         content.to_string()
     } else {
         let mut text = content.to_string();
-        for url in image_urls {
-            text.push_str(&format!("\n\n![图表]({})", url));
+        for url in &all_urls {
+            text.push_str(&format!("\n\n![图片]({})", url));
         }
         text
     };
@@ -2419,13 +2476,111 @@ async fn send_dingtalk_webhook(
     }
 }
 
+async fn send_dingtalk_private_message(
+    phone_number: &str,
+    content: &str,
+    image_urls: &[ String],
+) -> Result<(), String> {
+    if phone_number.is_empty() {
+        return Err("手机号为空".to_string());
+    }
+
+    let config = load_config_db()?;
+    if config.ding_app_key.is_empty() || config.ding_app_secret.is_empty() {
+        return Err("钉钉配置不完整，无法发送私聊消息".to_string());
+    }
+
+    let token = get_dingtalk_token_from_config().await?;
+    let userid = get_userid_by_mobile(phone_number.to_string()).await?;
+    let robot_code = &config.ding_app_key;
+    println!("[PrivateMsg] robot_code={}, userid={}, phone={}", robot_code, userid, phone_number);
+
+    // 从内容中自动提取图片链接，合并去重
+    let extracted = extract_image_urls(content);
+    let mut seen = std::collections::HashSet::new();
+    let all_urls: Vec<String> = image_urls
+        .iter()
+        .cloned()
+        .chain(extracted.into_iter())
+        .filter(|u| seen.insert(u.clone()))
+        .collect();
+
+    let markdown_text = if all_urls.is_empty() {
+        content.to_string()
+    } else {
+        let mut text = content.to_string();
+        for url in &all_urls {
+            text.push_str(&format!("\n\n![图片]({})", url));
+        }
+        text
+    };
+
+    let client = reqwest::Client::new();
+    let url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend";
+    let body = serde_json::json!({
+        "robotCode": robot_code,
+        "userIds": [userid],
+        "msgKey": "sampleMarkdown",
+        "msgParam": serde_json::json!({
+            "title": "数据定时报告",
+            "text": markdown_text
+        }).to_string()
+    });
+
+    let resp = client
+        .post(url)
+        .header("x-acs-dingtalk-access-token", &token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("发送单聊消息请求失败: {}", e))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    println!("钉钉单聊消息响应: {} {}", status, text);
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(code) = json.get("code").and_then(|v| v.as_str()) {
+            if !code.is_empty() && code != "0" {
+                let msg = json.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                return Err(format!(
+                    "发送单聊消息失败 [{}]: {}。请检查应用是否已添加 '企业内部机器人发送消息权限'",
+                    code, msg
+                ));
+            }
+        }
+    }
+
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("发送单聊消息失败: {} {}", status, text))
+    }
+}
+
+#[tauri::command]
+async fn test_private_message(phone_number: String, content: String) -> Result<String, String> {
+    if phone_number.is_empty() {
+        return Err("手机号不能为空".to_string());
+    }
+    let test_content = if content.is_empty() {
+        "这是一条定时任务私聊测试消息，如果您收到说明配置正确。"
+    } else {
+        &content
+    };
+    send_dingtalk_private_message(&phone_number, test_content, &[]).await?;
+    Ok("私聊测试发送成功，请检查钉钉".to_string())
+}
+
 #[tauri::command]
 async fn test_schedule_run(
     dashboard_id: String,
     prompt: String,
     webhook_url: String,
+    phone_number: String,
     task_type: Option<String>,
     sync_mode: Option<String>,
+    app: tauri::AppHandle,
 ) -> Result<String, String> {
     let task = task_type.unwrap_or_else(|| "analysis".to_string());
     let sync = sync_mode.unwrap_or_else(|| "overwrite".to_string());
@@ -2437,6 +2592,7 @@ async fn test_schedule_run(
         schedule_type: "once".to_string(),
         schedule_config: "{}".to_string(),
         webhook_url,
+        phone_number,
         task_type: task.clone(),
         sync_mode: sync.clone(),
         enabled: true,
@@ -2462,9 +2618,16 @@ async fn test_schedule_run(
             fetch_dingtalk_sheet_data(&token, &doc_url).await?
         };
 
+        println!(
+            "[TestSync] fetch 完成，doc_type={}，数据总行数={}（含表头），表头={:?}",
+            doc_type,
+            data.len(),
+            data.get(0)
+        );
+
         let table_name = dashboard.source_table.ok_or("看板没有关联数据表")?;
-        let conn = init_db()?;
-        let count = insert_data_into_table(&conn, &table_name, data, &sync)?;
+        let mut conn = init_db()?;
+        let count = insert_data_into_table(&mut conn, &table_name, data, &sync, Some(app.clone()))?;
 
         conn.execute(
             "UPDATE dashboards SET dingtalk_last_sync = datetime('now','localtime') WHERE id = ?1",
@@ -2500,8 +2663,26 @@ async fn test_schedule_run(
         }
     };
 
-    send_dingtalk_webhook(&schedule.webhook_url, &content_with_images, &image_urls
-    ).await?;
+    let webhook_urls = parse_comma_list(&schedule.webhook_url);
+    let phone_numbers = parse_comma_list(&schedule.phone_number);
+
+    let mut send_errors = vec![];
+
+    for url in &webhook_urls {
+        if let Err(e) = send_dingtalk_webhook(url, &content_with_images, &image_urls).await {
+            send_errors.push(format!("Webhook发送失败: {}", e));
+        }
+    }
+
+    for phone in &phone_numbers {
+        if let Err(e) = send_dingtalk_private_message(phone, &content_with_images, &image_urls).await {
+            send_errors.push(format!("私聊发送失败: {}", e));
+        }
+    }
+
+    if !send_errors.is_empty() {
+        return Err(send_errors.join("; "));
+    }
 
     Ok("测试发送成功，请检查钉钉".to_string())
 }
@@ -2759,7 +2940,9 @@ async fn fetch_dingtalk_sheet_data(token: &str, url: &str) -> Result<Vec<Vec<Str
     let cells_json: serde_json::Value = serde_json::from_str(&cells_text)
         .map_err(|e| format!("解析单元格数据失败: {}", e))?;
 
-    parse_sheet_cells(&cells_json)
+    let result = parse_sheet_cells(&cells_json)?;
+    println!("[DingTalk Sheet] 解析完成，共 {} 行（含表头）", result.len());
+    Ok(result)
 }
 
 async fn fetch_dingtalk_sheet_data_topapi(
@@ -2900,11 +3083,20 @@ fn parse_sheet_cells(json: &serde_json::Value) -> Result<Vec<Vec<String>>, Strin
     for cell in rows_data {
         let row = cell.get("row").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let col = cell.get("column").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let value = cell
-            .get("value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        // 钉钉 API 可能返回字符串、数字、布尔等多种类型，不能只用 as_str()
+        let value = cell.get("value").map(|v| {
+            if let Some(s) = v.as_str() {
+                s.to_string()
+            } else if let Some(n) = v.as_i64() {
+                n.to_string()
+            } else if let Some(n) = v.as_f64() {
+                n.to_string()
+            } else if let Some(b) = v.as_bool() {
+                b.to_string()
+            } else {
+                v.to_string()
+            }
+        }).unwrap_or_default();
 
         if row != current_row_idx {
             if !current_row.is_empty() {
@@ -3077,6 +3269,8 @@ async fn fetch_dingtalk_bitable_data(
         }
     }
 
+    println!("[DingTalk Bitable] 解析完成，共 {} 行（含表头）", result.len());
+
     if result.len() <= 1 {
         return Err("多维表记录为空".to_string());
     }
@@ -3142,10 +3336,26 @@ fn format_field_value(raw: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn insert_data_into_table(conn: &rusqlite::Connection, table_name: &str, data: Vec<Vec<String>>, mode: &str) -> Result<usize, String> {
+fn insert_data_into_table(
+    conn: &mut rusqlite::Connection,
+    table_name: &str,
+    data: Vec<Vec<String>>,
+    mode: &str,
+    app: Option<tauri::AppHandle>,
+) -> Result<usize, String> {
     if data.is_empty() {
         return Ok(0);
     }
+
+    // 防御保护：如果 fetch 到的数据只有表头没有数据行，拒绝执行（避免 overwrite 模式下清空原有数据）
+    if data.len() <= 1 {
+        return Err(format!(
+            "钉钉返回的数据只有表头（{}列）没有数据行，拒绝执行{}操作",
+            data[0].len(),
+            if mode == "overwrite" { "覆盖（会清空本地表）" } else { "追加" }
+        ));
+    }
+
     let headers = &data[0];
     let columns: Vec<String> = headers.iter().map(|h| format!("\"{}\"", h.replace('"', ""))).collect();
     let placeholders: Vec<String> = (1..=headers.len()).map(|i| format!("?{}", i)).collect();
@@ -3155,6 +3365,34 @@ fn insert_data_into_table(conn: &rusqlite::Connection, table_name: &str, data: V
         let _ = conn.execute(&format!("DELETE FROM \"{}\"", table_name), []);
     }
 
+    // 列兼容性：如果新表头中有旧表不存在的列，自动 ALTER TABLE ADD COLUMN
+    {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", table_name))
+            .map_err(|e| e.to_string())?;
+        let existing_cols: std::collections::HashSet<String> = stmt
+            .query_map([], |row| Ok(row.get::<_, String>("name")?))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        for header in headers {
+            if !existing_cols.contains(header) {
+                let alter_sql = format!(
+                    "ALTER TABLE \"{}\" ADD COLUMN \"{}\" TEXT",
+                    table_name,
+                    header.replace('"', "")
+                );
+                conn.execute(&alter_sql, [])
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "[DingTalk Sync] 表 {} 自动新增列: {}",
+                    table_name, header
+                );
+            }
+        }
+    }
+
     let sql = format!(
         "INSERT INTO \"{}\" ({}) VALUES ({})",
         table_name,
@@ -3162,14 +3400,48 @@ fn insert_data_into_table(conn: &rusqlite::Connection, table_name: &str, data: V
         placeholders.join(", ")
     );
 
+    // 使用事务批量插入，大幅提升性能并避免前端长时间等待
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let total_rows = data.len().saturating_sub(1);
     let mut count = 0usize;
-    for row in data.iter().skip(1) {
+    for (idx, row) in data.iter().skip(1).enumerate() {
         let params: Vec<&dyn rusqlite::ToSql> = row.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-        match conn.execute(&sql, rusqlite::params_from_iter(params)) {
-            Ok(_) => count += 1,
-            Err(e) => eprintln!("[DingTalk Sync] 插入行失败: {}", e),
+        match tx.execute(&sql, rusqlite::params_from_iter(params)) {
+            Ok(_) => {
+                count += 1;
+                if let Some(ref app_handle) = app {
+                    if (idx + 1) % 5 == 0 || idx + 1 == total_rows {
+                        let _ = app_handle.emit(
+                            "sync-progress",
+                            serde_json::json!({
+                                "current": idx + 1,
+                                "total": total_rows,
+                                "table": table_name,
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[DingTalk Sync] 插入行失败: {}", e);
+            }
         }
     }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // 发送完成事件
+    if let Some(ref app_handle) = app {
+        let _ = app_handle.emit(
+            "sync-progress",
+            serde_json::json!({
+                "current": total_rows,
+                "total": total_rows,
+                "table": table_name,
+                "done": true,
+            }),
+        );
+    }
+
     Ok(count)
 }
 
@@ -3178,6 +3450,7 @@ async fn sync_dingtalk_sheet(
     dashboard_id: String,
     operator_id: Option<String>,
     sync_mode: Option<String>,
+    app: tauri::AppHandle,
 ) -> Result<i32, String> {
     let dashboard = get_dashboard(dashboard_id.clone()).await?;
     let doc_url = dashboard.dingtalk_doc_url.ok_or("看板没有关联钉钉文档")?;
@@ -3203,9 +3476,9 @@ async fn sync_dingtalk_sheet(
     };
 
     let table_name = dashboard.source_table.ok_or("看板没有关联数据表")?;
-    let conn = init_db()?;
+    let mut conn = init_db()?;
     let mode = sync_mode.unwrap_or_else(|| "overwrite".to_string());
-    let count = insert_data_into_table(&conn, &table_name, data, &mode)?;
+    let count = insert_data_into_table(&mut conn, &table_name, data, &mode, Some(app.clone()))?;
 
     // 更新最后同步时间
     conn.execute(
@@ -3223,6 +3496,7 @@ async fn import_dingtalk_sheet(
     mode: String,
     prompt: Option<String>,
     operator_id: Option<String>,
+    app: tauri::AppHandle,
 ) -> Result<String, String> {
     let doc_type = parse_dingtalk_url(&url).map(|(t, _)| t).unwrap_or("sheet");
     let token = get_dingtalk_token_from_config().await?;
@@ -3239,7 +3513,7 @@ async fn import_dingtalk_sheet(
 
     // 创建本地表
     let table_name = format!("dingtalk_{}", Uuid::new_v4().to_string().replace("-", "").to_lowercase());
-    let conn = init_db()?;
+    let mut conn = init_db()?;
     let headers = &data[0];
     let col_defs: Vec<String> = headers.iter().map(|h| format!("\"{}\" TEXT", h.replace('"', ""))).collect();
     let create_sql = format!("CREATE TABLE IF NOT EXISTS \"{}\" ({})", table_name, col_defs.join(", "));
@@ -3249,7 +3523,7 @@ async fn import_dingtalk_sheet(
     println!("[DingTalk Import] 数据表 {} 创建成功，共 {} 行，模式: {}", table_name, row_count, mode);
 
     // 插入数据
-    insert_data_into_table(&conn, &table_name, data, "overwrite")?;
+    insert_data_into_table(&mut conn, &table_name, data, "overwrite", Some(app.clone()))?;
 
     // 创建看板：取前10行数据发给AI生成简易看板HTML（减少token消耗，加快速度）
     let data_md = query_result_to_markdown(
@@ -3313,12 +3587,10 @@ async fn import_dingtalk_sheet(
     Ok(dashboard_id)
 }
 
-#[tauri::command]
-async fn get_unionid_by_mobile(mobile: String) -> Result<String, String> {
+async fn get_userid_by_mobile(mobile: String) -> Result<String, String> {
     let token = get_dingtalk_token_from_config().await?;
     let client = reqwest::Client::new();
 
-    // 1. 手机号 -> UserID
     let userid_url = format!(
         "https://oapi.dingtalk.com/topapi/v2/user/getbymobile?access_token={}",
         token
@@ -3352,7 +3624,15 @@ async fn get_unionid_by_mobile(mobile: String) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or("响应中没有userid字段")?;
 
-    // 2. UserID -> UnionID
+    Ok(userid.to_string())
+}
+
+#[tauri::command]
+async fn get_unionid_by_mobile(mobile: String) -> Result<String, String> {
+    let userid = get_userid_by_mobile(mobile).await?;
+    let token = get_dingtalk_token_from_config().await?;
+    let client = reqwest::Client::new();
+
     let unionid_url = format!(
         "https://oapi.dingtalk.com/topapi/v2/user/get?access_token={}",
         token
@@ -6979,6 +7259,7 @@ pub fn run() {
             delete_schedule,
             get_schedules,
             get_schedule_logs,
+            test_private_message,
             test_schedule_run,
             sync_dingtalk_sheet,
             import_dingtalk_sheet,

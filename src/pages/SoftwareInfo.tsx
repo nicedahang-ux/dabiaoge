@@ -57,6 +57,34 @@ const FEATURES = [
 
 const CHANGELOG = [
   {
+    version: "1.0.6",
+    date: "2026-05-01",
+    items: [
+      "修复钉钉二次同步问题",
+    ],
+  },
+  {
+    version: "1.0.5",
+    date: "2026-05-01",
+    items: [
+      "支持同时多人钉钉私聊通知",
+    ],
+  },
+  {
+    version: "1.0.4",
+    date: "2026-05-01",
+    items: [
+      "新增钉钉私聊通知",
+    ],
+  },
+  {
+    version: "1.0.3",
+    date: "2026-05-01",
+    items: [
+      "增加钉钉表格同步和定时功能",
+    ],
+  },
+  {
     version: "1.0.2",
     date: "2026-04-27",
     items: [

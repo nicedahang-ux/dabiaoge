@@ -63,6 +63,7 @@ export interface Schedule {
   schedule_type: 'once' | 'daily' | 'weekly' | 'monthly' | 'interval';
   schedule_config: string;
   webhook_url: string;
+  phone_number: string;
   task_type: 'analysis' | 'sync';
   sync_mode: 'overwrite' | 'append';
   enabled: boolean;

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Dialog,
   DialogContent,
@@ -32,6 +33,7 @@ interface FormConfig {
   intervalDays: number;
   onceDate: string;
   webhookUrl: string;
+  phoneNumber: string;
   enabled: boolean;
   syncMode: "overwrite" | "append";
 }
@@ -62,6 +64,7 @@ function scheduleToConfig(s: Schedule): FormConfig {
     intervalDays: cfg.interval_days || 1,
     onceDate: cfg.date || "",
     webhookUrl: s.webhook_url,
+    phoneNumber: s.phone_number || "",
     enabled: s.enabled,
     syncMode: (s.sync_mode as "overwrite" | "append") || "overwrite",
   };
@@ -74,6 +77,7 @@ export default function ScheduleModal({
 }: ScheduleModalProps) {
   const [logs, setLogs] = useState<ScheduleLog[]>([]);
   const [testing, setTesting] = useState(false);
+  const [testingPrivate, setTestingPrivate] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const [activeType, setActiveType] = useState<"analysis" | "sync">("analysis");
@@ -91,6 +95,7 @@ export default function ScheduleModal({
       intervalDays: 1,
       onceDate: "",
       webhookUrl: "",
+      phoneNumber: "",
       enabled: true,
       syncMode: "overwrite",
     },
@@ -103,6 +108,7 @@ export default function ScheduleModal({
       intervalDays: 1,
       onceDate: "",
       webhookUrl: "",
+      phoneNumber: "",
       enabled: true,
       syncMode: "overwrite",
     },
@@ -131,6 +137,7 @@ export default function ScheduleModal({
         intervalDays: 1,
         onceDate: "",
         webhookUrl: "",
+        phoneNumber: "",
         enabled: true,
         syncMode: "overwrite",
       },
@@ -143,6 +150,7 @@ export default function ScheduleModal({
         intervalDays: 1,
         onceDate: "",
         webhookUrl: "",
+        phoneNumber: "",
         enabled: true,
         syncMode: "overwrite",
       },
@@ -173,6 +181,7 @@ export default function ScheduleModal({
               intervalDays: 1,
               onceDate: "",
               webhookUrl: "",
+              phoneNumber: "",
               enabled: true,
               syncMode: "overwrite",
             },
@@ -187,6 +196,7 @@ export default function ScheduleModal({
               intervalDays: 1,
               onceDate: "",
               webhookUrl: "",
+              phoneNumber: "",
               enabled: true,
               syncMode: "overwrite",
             },
@@ -246,6 +256,7 @@ export default function ScheduleModal({
           scheduleType: cfg.scheduleType,
           scheduleConfig: JSON.stringify(scheduleConfig),
           webhookUrl: cfg.webhookUrl,
+          phoneNumber: cfg.phoneNumber,
           enabled: cfg.enabled,
           taskType: activeType,
           syncMode: cfg.syncMode,
@@ -260,6 +271,7 @@ export default function ScheduleModal({
           scheduleType: cfg.scheduleType,
           scheduleConfig: JSON.stringify(scheduleConfig),
           webhookUrl: cfg.webhookUrl,
+          phoneNumber: cfg.phoneNumber,
           taskType: activeType,
           syncMode: cfg.syncMode,
         });
@@ -276,6 +288,34 @@ export default function ScheduleModal({
     }
   };
 
+  // 监听后端同步进度事件
+  useEffect(() => {
+    let unlistenFn: (() => void) | null = null;
+    listen("sync-progress", (event) => {
+      const payload = event.payload as {
+        current: number;
+        total: number;
+        table: string;
+        done?: boolean;
+      };
+      if (payload.done) {
+        toast.success(`同步完成，共写入 ${payload.total} 条记录`, {
+          id: "sync-progress",
+        });
+      } else {
+        toast.loading(
+          `正在同步 ${payload.table}… ${payload.current}/${payload.total}`,
+          { id: "sync-progress" }
+        );
+      }
+    }).then((fn) => {
+      unlistenFn = fn;
+    });
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  }, []);
+
   const handleTest = async () => {
     if (!dashboard) return;
     const cfg = current;
@@ -286,6 +326,7 @@ export default function ScheduleModal({
         dashboardId: dashboard.id,
         prompt: cfg.prompt,
         webhookUrl: cfg.webhookUrl,
+        phoneNumber: cfg.phoneNumber,
         taskType: activeType,
         syncMode: cfg.syncMode,
       });
@@ -294,6 +335,37 @@ export default function ScheduleModal({
       toast.error("测试执行失败", { description: String(e) });
     } finally {
       setTesting(false);
+    }
+  };
+
+  const parsePhones = (raw: string): string[] => {
+    return raw
+      .split(/[,\s\n]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  };
+
+  const handleTestPrivate = async () => {
+    const phones = parsePhones(current.phoneNumber);
+    if (phones.length === 0) {
+      toast.error("请先填写接收人手机号");
+      return;
+    }
+    setTestingPrivate(true);
+    try {
+      const results: string[] = [];
+      for (const phone of phones) {
+        const result = await invoke<string>("test_private_message", {
+          phoneNumber: phone,
+          content: "",
+        });
+        results.push(`${phone}: ${result}`);
+      }
+      toast.success(results.join("\n"));
+    } catch (e) {
+      toast.error("私聊测试失败", { description: String(e) });
+    } finally {
+      setTestingPrivate(false);
     }
   };
 
@@ -546,24 +618,41 @@ export default function ScheduleModal({
               </Tabs>
             </div>
 
+            {/* 手机号 */}
+            <div className="space-y-2">
+              <Label>接收人手机号（支持多个）</Label>
+              <Textarea
+                placeholder="13800138000,13900139000&#10;支持逗号、换行或空格分隔多个手机号"
+                value={current.phoneNumber}
+                onChange={(e) =>
+                  updateCurrent({ phoneNumber: e.target.value })
+                }
+                rows={2}
+              />
+              <p className="text-[11px] text-slate-400">
+                填写后分析报告将通过钉钉私聊发送给这些用户，可与群 Webhook 同时使用
+              </p>
+            </div>
+
             {/* Webhook */}
             <div className="space-y-2">
               <Label>
                 {activeType === "analysis"
-                  ? "钉钉 Webhook 地址"
-                  : "钉钉 Webhook 地址（可选，同步成功后推送通知）"}
+                  ? "钉钉 Webhook 地址（支持多个）"
+                  : "钉钉 Webhook 地址（可选，同步成功后推送通知，支持多个）"}
               </Label>
-              <Input
-                placeholder="https://oapi.dingtalk.com/robot/send?access_token=xxx"
+              <Textarea
+                placeholder="https://oapi.dingtalk.com/robot/send?access_token=xxx&#10;支持逗号、换行或空格分隔多个群地址"
                 value={current.webhookUrl}
                 onChange={(e) =>
                   updateCurrent({ webhookUrl: e.target.value })
                 }
+                rows={2}
               />
               <p className="text-[11px] text-slate-400">
                 {activeType === "analysis"
-                  ? "在钉钉群设置中添加机器人，复制Webhook地址粘贴到这里"
-                  : "填写后每次同步完成会发送一条通知到钉钉群"}
+                  ? "在钉钉群设置中添加机器人，复制Webhook地址粘贴到这里，支持同时发送到多个群"
+                  : "填写后每次同步完成会发送一条通知到这些钉钉群"}
               </p>
             </div>
 
@@ -612,6 +701,20 @@ export default function ScheduleModal({
               <Send className="h-3 w-3" />
             )}
             {activeType === "analysis" ? "测试分析" : "测试同步"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleTestPrivate}
+            disabled={testingPrivate || !current.phoneNumber}
+            className="gap-1"
+          >
+            {testingPrivate ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Send className="h-3 w-3" />
+            )}
+            测试私聊
           </Button>
           <Button
             variant="outline"

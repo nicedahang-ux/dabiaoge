@@ -1,5 +1,29 @@
 [
   {
+    "version": "1.0.6",
+    "date": "2026-05-01",
+    "notes": "修复钉钉二次同步问题",
+    "filename": "AI表格转看板_1.0.6_x64-setup.nsis.zip"
+  },
+  {
+    "version": "1.0.5",
+    "date": "2026-05-01",
+    "notes": "支持同时多人钉钉私聊通知",
+    "filename": "AI表格转看板_1.0.5_x64-setup.nsis.zip"
+  },
+  {
+    "version": "1.0.4",
+    "date": "2026-05-01",
+    "notes": "新增钉钉私聊通知",
+    "filename": "AI表格转看板_1.0.4_x64-setup.nsis.zip"
+  },
+  {
+    "version": "1.0.3",
+    "date": "2026-05-01",
+    "notes": "增加钉钉表格同步和定时功能",
+    "filename": "AI表格转看板_1.0.3_x64-setup.nsis.zip"
+  },
+  {
     "version": "1.0.2",
     "date": "2026-04-27",
     "notes": "新增字体可调整，侧边栏可拖拽宽度",
